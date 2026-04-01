@@ -400,24 +400,29 @@ class SignalAdapter(BasePlatformAdapter):
         envelope_data = envelope.get("envelope", envelope)
 
         # Handle syncMessage: extract "Note to Self" messages (sent to own account)
-        # while still filtering other sync events (read receipts, typing, etc.)
+        # and group messages sent by the account owner (also arrive as syncMessage).
+        # Filter other sync events (read receipts, typing, etc.)
+        is_sync_promoted = False
         is_note_to_self = False
         if "syncMessage" in envelope_data:
             sync_msg = envelope_data.get("syncMessage")
             if sync_msg and isinstance(sync_msg, dict):
                 sent_msg = sync_msg.get("sentMessage")
                 if sent_msg and isinstance(sent_msg, dict):
-                    dest = sent_msg.get("destinationNumber") or sent_msg.get("destination")
                     sent_ts = sent_msg.get("timestamp")
-                    if dest == self._account_normalized:
+                    dest = sent_msg.get("destinationNumber") or sent_msg.get("destination")
+                    has_group = bool(sent_msg.get("groupInfo"))
+                    if dest == self._account_normalized or has_group:
                         # Check if this is an echo of our own outbound reply
                         if sent_ts and sent_ts in self._recent_sent_timestamps:
                             self._recent_sent_timestamps.discard(sent_ts)
                             return
-                        # Genuine user Note to Self — promote to dataMessage
-                        is_note_to_self = True
+                        # Genuine user message — promote to dataMessage
+                        # (Note to Self or own message in a group chat)
+                        is_sync_promoted = True
+                        is_note_to_self = dest == self._account_normalized and not has_group
                         envelope_data = {**envelope_data, "dataMessage": sent_msg}
-            if not is_note_to_self:
+            if not is_sync_promoted:
                 return
 
         # Extract sender info
@@ -433,8 +438,9 @@ class SignalAdapter(BasePlatformAdapter):
             logger.debug("Signal: ignoring envelope with no sender")
             return
 
-        # Self-message filtering — prevent reply loops (but allow Note to Self)
-        if self._account_normalized and sender == self._account_normalized and not is_note_to_self:
+        # Self-message filtering — prevent reply loops (but allow Note to Self
+        # and sync-promoted group messages where the account owner sent a message)
+        if self._account_normalized and sender == self._account_normalized and not is_sync_promoted:
             return
 
         # Filter stories

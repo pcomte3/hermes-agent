@@ -361,6 +361,274 @@ class TestSignalAuthorization:
 # Send Message Tool
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Envelope Handling (_handle_envelope) — syncMessage promotion
+# ---------------------------------------------------------------------------
+
+class TestSignalHandleEnvelope:
+    """Test _handle_envelope correctly routes syncMessages for groups and Note to Self."""
+
+    def _make_adapter_with_mock_handler(self, monkeypatch, account="+155****4567", **extra):
+        """Create adapter with handle_message mocked to capture dispatched events."""
+        adapter = _make_signal_adapter(monkeypatch, account=account, **extra)
+        captured_events = []
+
+        async def mock_handle_message(event):
+            captured_events.append(event)
+
+        adapter.handle_message = mock_handle_message
+        return adapter, captured_events
+
+    @pytest.mark.asyncio
+    async def test_group_syncmessage_is_processed(self, monkeypatch):
+        """Own messages in group chats arrive as syncMessage and must be promoted."""
+        adapter, events = self._make_adapter_with_mock_handler(
+            monkeypatch, group_allowed="*"
+        )
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "Hello group!",
+                        "groupInfo": {
+                            "groupId": "group-abc-123",
+                            "groupName": "Test Group",
+                        },
+                    }
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 1
+        assert events[0].text == "Hello group!"
+        assert events[0].source.chat_type == "group"
+        assert events[0].source.chat_id == "group:group-abc-123"
+
+    @pytest.mark.asyncio
+    async def test_note_to_self_still_works(self, monkeypatch):
+        """Note to Self (syncMessage to own account) must still be processed."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1700000000000,
+                        "destinationNumber": "+155****4567",
+                        "message": "Note to myself",
+                    }
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 1
+        assert events[0].text == "Note to myself"
+        assert events[0].source.chat_type == "dm"
+
+    @pytest.mark.asyncio
+    async def test_group_syncmessage_echo_filtered(self, monkeypatch):
+        """Bot's own outbound replies (tracked timestamps) must be filtered."""
+        adapter, events = self._make_adapter_with_mock_handler(
+            monkeypatch, group_allowed="*"
+        )
+        # Simulate a previously sent message timestamp
+        adapter._recent_sent_timestamps.add(1700000000000)
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "Bot reply echo",
+                        "groupInfo": {
+                            "groupId": "group-abc-123",
+                            "groupName": "Test Group",
+                        },
+                    }
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0, "Echo of bot's own reply should be filtered"
+
+    @pytest.mark.asyncio
+    async def test_note_to_self_echo_filtered(self, monkeypatch):
+        """Bot's own Note to Self replies must be filtered by timestamp."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        adapter._recent_sent_timestamps.add(1700000000000)
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1700000000000,
+                        "destinationNumber": "+155****4567",
+                        "message": "Bot reply to self",
+                    }
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0, "Echo of bot's own Note to Self reply should be filtered"
+
+    @pytest.mark.asyncio
+    async def test_non_sent_syncmessage_ignored(self, monkeypatch):
+        """Sync events without sentMessage (read receipts, typing) must be ignored."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "readMessages": [{"sender": "+155****9999", "timestamp": 1699999999000}]
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0
+
+    @pytest.mark.asyncio
+    async def test_regular_dm_from_other_user(self, monkeypatch):
+        """Normal DM from another user (dataMessage, not syncMessage) works."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****9999",
+                "sourceName": "Other User",
+                "sourceUuid": "uuid-other",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "timestamp": 1700000000000,
+                    "message": "Hello from another user",
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 1
+        assert events[0].text == "Hello from another user"
+        assert events[0].source.chat_type == "dm"
+
+    @pytest.mark.asyncio
+    async def test_regular_group_from_other_user(self, monkeypatch):
+        """Normal group message from another user (dataMessage) works."""
+        adapter, events = self._make_adapter_with_mock_handler(
+            monkeypatch, group_allowed="*"
+        )
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****9999",
+                "sourceName": "Other User",
+                "sourceUuid": "uuid-other",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "timestamp": 1700000000000,
+                    "message": "Group msg from other",
+                    "groupInfo": {
+                        "groupId": "group-abc-123",
+                        "groupName": "Test Group",
+                    },
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 1
+        assert events[0].text == "Group msg from other"
+        assert events[0].source.chat_type == "group"
+
+    @pytest.mark.asyncio
+    async def test_group_syncmessage_blocked_without_allowlist(self, monkeypatch):
+        """Own group messages must be blocked when SIGNAL_GROUP_ALLOWED_USERS is unset."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        # group_allowed defaults to "" → empty set
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "Hello group!",
+                        "groupInfo": {
+                            "groupId": "group-abc-123",
+                            "groupName": "Test Group",
+                        },
+                    }
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0, "Group message should be blocked without allowlist"
+
+    @pytest.mark.asyncio
+    async def test_group_syncmessage_blocked_wrong_group(self, monkeypatch):
+        """Own group messages must be blocked when group ID is not in allowlist."""
+        adapter, events = self._make_adapter_with_mock_handler(
+            monkeypatch, group_allowed="group-other-456"
+        )
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "Hello group!",
+                        "groupInfo": {
+                            "groupId": "group-abc-123",
+                            "groupName": "Test Group",
+                        },
+                    }
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0, "Group message should be blocked when group not in allowlist"
+
+    @pytest.mark.asyncio
+    async def test_self_dm_without_sync_is_filtered(self, monkeypatch):
+        """A dataMessage from own account (not via syncMessage) should be filtered as self-message."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****4567",
+                "sourceName": "Test User",
+                "sourceUuid": "uuid-1234",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "timestamp": 1700000000000,
+                    "message": "Should be filtered",
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0, "Self-sent dataMessage should be filtered to prevent loops"
+
+
+# ---------------------------------------------------------------------------
+# Send Message Tool
+# ---------------------------------------------------------------------------
+
 class TestSignalSendMessage:
     def test_signal_in_platform_map(self):
         """Signal should be in the send_message tool's platform map."""
