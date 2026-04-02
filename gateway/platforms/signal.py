@@ -461,11 +461,22 @@ class SignalAdapter(BasePlatformAdapter):
         group_id = group_info.get("groupId") if group_info else None
         is_group = bool(group_id)
 
+        # Signal runs on the user's personal phone number — unlike Telegram/
+        # Discord bots which have their own accounts.  This means ALL incoming
+        # DMs from any contact arrive here.  We must ONLY process:
+        #   1. "Note to Self" messages (user talking to the bot)
+        #   2. Allowed group messages
+        # Any other DM is a personal message to the phone owner and must be
+        # silently ignored — never forwarded to run.py or auto-replied to.
+        if not is_group and not is_note_to_self:
+            logger.debug("Signal: ignoring DM from %s (not Note to Self)",
+                         sender_name or sender[:6] if sender else "?")
+            return
+
         # Group message filtering — derived from SIGNAL_GROUP_ALLOWED_USERS:
         # - No env var set → groups disabled (default safe behavior)
         # - Env var set with group IDs → only those groups allowed
         # - Env var set with "*" → all groups allowed
-        # DM auth is fully handled by run.py (_is_user_authorized)
         if is_group:
             if not self.group_allow_from:
                 logger.debug("Signal: ignoring group message (no SIGNAL_GROUP_ALLOWED_USERS)")

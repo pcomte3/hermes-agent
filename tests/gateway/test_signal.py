@@ -505,8 +505,11 @@ class TestSignalHandleEnvelope:
         assert len(events) == 0
 
     @pytest.mark.asyncio
-    async def test_regular_dm_from_other_user(self, monkeypatch):
-        """Normal DM from another user (dataMessage, not syncMessage) works."""
+    async def test_regular_dm_from_other_user_is_dropped(self, monkeypatch):
+        """DM from another user must be silently dropped — Signal runs on the
+        owner's personal phone number, so other people's DMs are personal
+        messages to the phone owner, NOT bot commands.  Only Note to Self and
+        allowed groups should be processed."""
         adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
         envelope = {
             "envelope": {
@@ -521,9 +524,30 @@ class TestSignalHandleEnvelope:
             }
         }
         await adapter._handle_envelope(envelope)
-        assert len(events) == 1
-        assert events[0].text == "Hello from another user"
-        assert events[0].source.chat_type == "dm"
+        assert len(events) == 0, "DMs from other users must be silently ignored"
+
+    @pytest.mark.asyncio
+    async def test_stranger_dm_never_triggers_pairing(self, monkeypatch):
+        """Security: stranger DMs must be dropped at the adapter level, never
+        reaching run.py where pairing code auto-reply could fire."""
+        adapter, events = self._make_adapter_with_mock_handler(monkeypatch)
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+499876543210",
+                "sourceName": "Unknown Contact",
+                "sourceUuid": "uuid-stranger",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "timestamp": 1700000000000,
+                    "message": "Hey, are you there?",
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+        assert len(events) == 0, (
+            "Stranger DMs must NEVER reach the handler — prevents "
+            "auto-reply with pairing codes on personal phone number"
+        )
 
     @pytest.mark.asyncio
     async def test_regular_group_from_other_user(self, monkeypatch):
