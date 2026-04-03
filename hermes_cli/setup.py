@@ -114,6 +114,8 @@ _DEFAULT_PROVIDER_MODELS = {
     "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
+    "opencode-zen": ["gpt-5.4", "gpt-5.3-codex", "claude-sonnet-4-6", "gemini-3-flash", "glm-5", "kimi-k2.5", "minimax-m2.7"],
+    "opencode-go": ["glm-5", "kimi-k2.5", "minimax-m2.5", "minimax-m2.7"],
     "huggingface": [
         "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
@@ -189,6 +191,8 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
         fetch_api_models,
         fetch_github_model_catalog,
         normalize_copilot_model_id,
+        normalize_opencode_model_id,
+        opencode_model_api_mode,
     )
 
     pconfig = PROVIDER_REGISTRY[provider_id]
@@ -242,6 +246,11 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
                 f"    Use \"Custom model\" if the model you expect isn't listed."
             )
 
+    if provider_id in {"opencode-zen", "opencode-go"}:
+        provider_models = [normalize_opencode_model_id(provider_id, mid) for mid in provider_models]
+        current_model = normalize_opencode_model_id(provider_id, current_model)
+        provider_models = list(dict.fromkeys(mid for mid in provider_models if mid))
+
     model_choices = list(provider_models)
     model_choices.append("Custom model")
     model_choices.append(f"Keep current ({current_model})")
@@ -259,6 +268,8 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
                 catalog=catalog,
                 api_key=api_key,
             ) or selected_model
+        elif provider_id in {"opencode-zen", "opencode-go"}:
+            selected_model = normalize_opencode_model_id(provider_id, selected_model)
         _set_default_model(config, selected_model)
     elif model_idx == len(provider_models):
         custom = prompt_fn("Enter model name")
@@ -269,6 +280,8 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
                     catalog=catalog,
                     api_key=api_key,
                 ) or custom
+            elif provider_id in {"opencode-zen", "opencode-go"}:
+                selected_model = normalize_opencode_model_id(provider_id, custom)
             else:
                 selected_model = custom
             _set_default_model(config, selected_model)
@@ -300,6 +313,10 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
             catalog=catalog,
             api_key=api_key,
         )
+    elif provider_id in {"opencode-zen", "opencode-go"} and selected_model:
+        model_cfg = _model_config_dict(config)
+        model_cfg["api_mode"] = opencode_model_api_mode(provider_id, selected_model)
+        config["model"] = model_cfg
 
 
 def _sync_model_from_disk(config: Dict[str, Any]) -> None:
@@ -1808,13 +1825,22 @@ def setup_gateway(config: dict):
             print_info("   1. Message @userinfobot on Telegram")
             print_info("   2. It will reply with your numeric ID (e.g., 123456789)")
             print()
+            existing_allowlist = get_env_value("TELEGRAM_ALLOWED_USERS")
+            if existing_allowlist:
+                print_info(f"   Current allowlist: {existing_allowlist}")
             allowed_users = prompt(
-                "Allowed user IDs (comma-separated, leave empty for open access)"
+                "Allowed user IDs (comma-separated, leave empty to "
+                + ("keep current" if existing_allowlist else "allow open access")
+                + ")"
             )
             if allowed_users:
                 save_env_value("TELEGRAM_ALLOWED_USERS", allowed_users.replace(" ", ""))
                 print_success(
                     "Telegram allowlist configured - only listed users can use the bot"
+                )
+            elif existing_allowlist:
+                print_success(
+                    f"Keeping existing Telegram allowlist: {existing_allowlist}"
                 )
             else:
                 print_info(
@@ -1887,8 +1913,13 @@ def setup_gateway(config: dict):
                 "   You can also use Discord usernames (resolved on gateway start)."
             )
             print()
+            existing_allowlist = get_env_value("DISCORD_ALLOWED_USERS")
+            if existing_allowlist:
+                print_info(f"   Current allowlist: {existing_allowlist}")
             allowed_users = prompt(
-                "Allowed user IDs or usernames (comma-separated, leave empty for open access)"
+                "Allowed user IDs or usernames (comma-separated, leave empty to "
+                + ("keep current" if existing_allowlist else "allow open access")
+                + ")"
             )
             if allowed_users:
                 # Clean up common prefixes (user:123, <@123>, <@!123>)
@@ -1903,6 +1934,10 @@ def setup_gateway(config: dict):
                         cleaned_ids.append(uid)
                 save_env_value("DISCORD_ALLOWED_USERS", ",".join(cleaned_ids))
                 print_success("Discord allowlist configured")
+            elif existing_allowlist:
+                print_success(
+                    f"Keeping existing Discord allowlist: {existing_allowlist}"
+                )
             else:
                 print_info(
                     "⚠️  No allowlist set - anyone in servers with your bot can use it!"
@@ -1999,12 +2034,21 @@ def setup_gateway(config: dict):
                 "   To find a Member ID: click a user's name → View full profile → ⋮ → Copy member ID"
             )
             print()
+            existing_allowlist = get_env_value("SLACK_ALLOWED_USERS")
+            if existing_allowlist:
+                print_info(f"   Current allowlist: {existing_allowlist}")
             allowed_users = prompt(
-                "Allowed user IDs (comma-separated, leave empty to deny everyone except paired users)"
+                "Allowed user IDs (comma-separated, leave empty to "
+                + ("keep current" if existing_allowlist else "deny everyone except paired users")
+                + ")"
             )
             if allowed_users:
                 save_env_value("SLACK_ALLOWED_USERS", allowed_users.replace(" ", ""))
                 print_success("Slack allowlist configured")
+            elif existing_allowlist:
+                print_success(
+                    f"Keeping existing Slack allowlist: {existing_allowlist}"
+                )
             else:
                 print_warning(
                     "⚠️  No Slack allowlist set - unpaired users will be denied by default."
@@ -2088,12 +2132,21 @@ def setup_gateway(config: dict):
             print_info("🔒 Security: Restrict who can use your bot")
             print_info("   Matrix user IDs look like @username:server")
             print()
+            existing_allowlist = get_env_value("MATRIX_ALLOWED_USERS")
+            if existing_allowlist:
+                print_info(f"   Current allowlist: {existing_allowlist}")
             allowed_users = prompt(
-                "Allowed user IDs (comma-separated, leave empty for open access)"
+                "Allowed user IDs (comma-separated, leave empty to "
+                + ("keep current" if existing_allowlist else "allow open access")
+                + ")"
             )
             if allowed_users:
                 save_env_value("MATRIX_ALLOWED_USERS", allowed_users.replace(" ", ""))
                 print_success("Matrix allowlist configured")
+            elif existing_allowlist:
+                print_success(
+                    f"Keeping existing Matrix allowlist: {existing_allowlist}"
+                )
             else:
                 print_info(
                     "⚠️  No allowlist set - anyone who can message the bot can use it!"
@@ -2134,12 +2187,21 @@ def setup_gateway(config: dict):
             print_info("   To find your user ID: click your avatar → Profile")
             print_info("   or use the API: GET /api/v4/users/me")
             print()
+            existing_allowlist = get_env_value("MATTERMOST_ALLOWED_USERS")
+            if existing_allowlist:
+                print_info(f"   Current allowlist: {existing_allowlist}")
             allowed_users = prompt(
-                "Allowed user IDs (comma-separated, leave empty for open access)"
+                "Allowed user IDs (comma-separated, leave empty to "
+                + ("keep current" if existing_allowlist else "allow open access")
+                + ")"
             )
             if allowed_users:
                 save_env_value("MATTERMOST_ALLOWED_USERS", allowed_users.replace(" ", ""))
                 print_success("Mattermost allowlist configured")
+            elif existing_allowlist:
+                print_success(
+                    f"Keeping existing Mattermost allowlist: {existing_allowlist}"
+                )
             else:
                 print_info(
                     "⚠️  No allowlist set - anyone who can message the bot can use it!"
