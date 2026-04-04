@@ -5809,7 +5809,7 @@ class AIAgent:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
             # Truncate oversized results
-            MAX_TOOL_RESULT_CHARS = 100_000
+            MAX_TOOL_RESULT_CHARS = 30_000
             if len(function_result) > MAX_TOOL_RESULT_CHARS:
                 original_len = len(function_result)
                 function_result = (
@@ -6069,7 +6069,7 @@ class AIAgent:
             # blow up the context window. 100K chars ≈ 25K tokens — generous
             # enough for any reasonable tool output but prevents catastrophic
             # context explosions (e.g. accidental base64 image dumps).
-            MAX_TOOL_RESULT_CHARS = 100_000
+            MAX_TOOL_RESULT_CHARS = 30_000
             if len(function_result) > MAX_TOOL_RESULT_CHARS:
                 original_len = len(function_result)
                 function_result = (
