@@ -1193,6 +1193,11 @@ class HermesCLI:
         # Inline diff previews for write actions (display.inline_diffs in config.yaml)
         self._inline_diffs_enabled = CLI_CONFIG["display"].get("inline_diffs", True)
 
+        # Markdown rendering (display.markdown in config.yaml)
+        self._markdown_enabled = CLI_CONFIG["display"].get("markdown", True)
+        self._pygments_theme = self._resolve_pygments_theme()
+        self._md_stream_processor = None
+
         # Streaming display state
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
@@ -1814,6 +1819,26 @@ class HermesCLI:
         if flush_text:
             self._emit_reasoning_preview(flush_text)
 
+    def _resolve_pygments_theme(self) -> str:
+        """Pick a Pygments theme that matches the active skin."""
+        explicit = CLI_CONFIG["display"].get("code_theme", "")
+        if explicit:
+            return explicit
+        try:
+            from hermes_cli.skin_engine import get_active_skin
+            skin = get_active_skin()
+            if skin.code_theme:
+                return skin.code_theme
+            _SKIN_THEME_MAP = {
+                "default": "monokai", "ares": "monokai",
+                "mono": "friendly_grayscale", "slate": "nord",
+                "poseidon": "nord", "sisyphus": "friendly_grayscale",
+                "charizard": "monokai",
+            }
+            return _SKIN_THEME_MAP.get(skin.name, "monokai")
+        except Exception:
+            return "monokai"
+
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning/thinking tokens into a dim box above the response.
 
@@ -2002,7 +2027,17 @@ class HermesCLI:
         _tc = getattr(self, "_stream_text_ansi", "")
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
-            _cprint(f"{_tc}{line}{_RST}" if _tc else line)
+            if self._markdown_enabled:
+                if self._md_stream_processor is None:
+                    from hermes_cli.markdown_stream import MarkdownStreamProcessor
+                    self._md_stream_processor = MarkdownStreamProcessor(
+                        base_ansi=_tc, pygments_theme=self._pygments_theme,
+                    )
+                _rendered = self._md_stream_processor.feed_line(line)
+                if _rendered is not None:
+                    _cprint(_rendered)
+            else:
+                _cprint(f"{_tc}{line}{_RST}" if _tc else line)
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
@@ -2011,8 +2046,19 @@ class HermesCLI:
 
         if self._stream_buf:
             _tc = getattr(self, "_stream_text_ansi", "")
-            _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
+            if self._markdown_enabled and self._md_stream_processor is not None:
+                _rendered = self._md_stream_processor.feed_line(self._stream_buf)
+                if _rendered is not None:
+                    _cprint(_rendered)
+            else:
+                _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
             self._stream_buf = ""
+
+        # Flush markdown processor (e.g. unclosed code block)
+        if self._markdown_enabled and self._md_stream_processor is not None:
+            _tail = self._md_stream_processor.flush()
+            if _tail:
+                _cprint(_tail)
 
         # Close the response box
         if self._stream_box_opened:
@@ -2031,6 +2077,7 @@ class HermesCLI:
         self._reasoning_box_opened = False
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
+        self._md_stream_processor = None
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -4390,6 +4437,11 @@ class HermesCLI:
             self._toggle_yolo()
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
+        elif canonical == "markdown":
+            self._markdown_enabled = not self._markdown_enabled
+            _state = "ON" if self._markdown_enabled else "OFF"
+            save_config_value("display.markdown", self._markdown_enabled)
+            _cprint(f"  {_GOLD}✓ Markdown rendering: {_state} (saved){_RST}")
         elif canonical == "compress":
             self._manual_compress()
         elif canonical == "usage":
@@ -4681,8 +4733,13 @@ class HermesCLI:
                         _resp_text = "#FFF8DC"
 
                     _chat_console = ChatConsole()
+                    if self._markdown_enabled:
+                        from hermes_cli.markdown_stream import render_markdown_rich
+                        _bg_content = render_markdown_rich(response, pygments_theme=self._pygments_theme)
+                    else:
+                        _bg_content = _rich_text_from_ansi(response)
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _bg_content,
                         title=f"[{_resp_color} bold]{label} (background #{task_num})[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -4804,8 +4861,13 @@ class HermesCLI:
                     except Exception:
                         _resp_color = "#4F6D4A"
 
+                    if self._markdown_enabled:
+                        from hermes_cli.markdown_stream import render_markdown_rich
+                        _btw_content = render_markdown_rich(response, pygments_theme=self._pygments_theme)
+                    else:
+                        _btw_content = _rich_text_from_ansi(response)
                     ChatConsole().print(Panel(
-                        _rich_text_from_ansi(response),
+                        _btw_content,
                         title=f"[{_resp_color} bold]⚕ /btw[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -6600,8 +6662,13 @@ class HermesCLI:
                     pass
                 else:
                     _chat_console = ChatConsole()
+                    if self._markdown_enabled:
+                        from hermes_cli.markdown_stream import render_markdown_rich
+                        _content = render_markdown_rich(response, pygments_theme=self._pygments_theme)
+                    else:
+                        _content = _rich_text_from_ansi(response)
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _content,
                         title=f"[{_resp_color} bold]{label}[/]",
                         title_align="left",
                         border_style=_resp_color,
