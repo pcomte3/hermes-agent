@@ -908,7 +908,7 @@ def select_provider_and_model(args=None):
         try:
             active = resolve_provider("auto")
         except AuthError:
-            active = "openrouter"  # no provider yet; show full picker
+            active = None  # no provider yet; default to first in list
 
     # Detect custom endpoint
     if active == "openrouter" and get_env_value("OPENAI_BASE_URL"):
@@ -921,6 +921,7 @@ def select_provider_and_model(args=None):
         "copilot-acp": "GitHub Copilot ACP",
         "copilot": "GitHub Copilot",
         "anthropic": "Anthropic",
+        "gemini": "Google AI Studio",
         "zai": "Z.AI / GLM",
         "kimi-coding": "Kimi / Moonshot",
         "minimax": "MiniMax",
@@ -933,21 +934,26 @@ def select_provider_and_model(args=None):
         "huggingface": "Hugging Face",
         "custom": "Custom endpoint",
     }
-    active_label = provider_labels.get(active, active)
+    active_label = provider_labels.get(active, active) if active else "none"
 
     print()
     print(f"  Current model:    {current_model}")
     print(f"  Active provider:  {active_label}")
     print()
 
-    # Step 1: Provider selection — put active provider first with marker
-    providers = [
-        ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
+    # Step 1: Provider selection — top providers shown first, rest behind "More..."
+    top_providers = [
         ("nous", "Nous Portal (Nous Research subscription)"),
-        ("openai-codex", "OpenAI Codex"),
-        ("copilot-acp", "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"),
-        ("copilot", "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)"),
+        ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("anthropic", "Anthropic (Claude models — API key or Claude Code)"),
+        ("openai-codex", "OpenAI Codex"),
+        ("copilot", "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)"),
+        ("huggingface", "Hugging Face Inference Providers (20+ open models)"),
+    ]
+
+    extended_providers = [
+        ("copilot-acp", "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"),
+        ("gemini", "Google AI Studio (Gemini models — OpenAI-compatible endpoint)"),
         ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
         ("minimax", "MiniMax (global direct API)"),
@@ -957,7 +963,6 @@ def select_provider_and_model(args=None):
         ("opencode-go", "OpenCode Go (open models, $10/month subscription)"),
         ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
         ("alibaba", "Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
-        ("huggingface", "Hugging Face Inference Providers (20+ open models)"),
     ]
 
     # Add user-defined custom providers from config.yaml
@@ -971,12 +976,11 @@ def select_provider_and_model(args=None):
             base_url = (entry.get("base_url") or "").strip()
             if not name or not base_url:
                 continue
-            # Generate a stable key from the name
             key = "custom:" + name.lower().replace(" ", "-")
             short_url = base_url.replace("https://", "").replace("http://", "").rstrip("/")
             saved_model = entry.get("model", "")
             model_hint = f" — {saved_model}" if saved_model else ""
-            providers.append((key, f"{name} ({short_url}){model_hint}"))
+            top_providers.append((key, f"{name} ({short_url}){model_hint}"))
             _custom_provider_map[key] = {
                 "name": name,
                 "base_url": base_url,
@@ -984,30 +988,53 @@ def select_provider_and_model(args=None):
                 "model": saved_model,
             }
 
-    # Always add the manual custom endpoint option last
-    providers.append(("custom", "Custom endpoint (enter URL manually)"))
+    top_keys = {k for k, _ in top_providers}
+    extended_keys = {k for k, _ in extended_providers}
 
-    # Add removal option if there are saved custom providers
-    if _custom_provider_map:
-        providers.append(("remove-custom", "Remove a saved custom provider"))
+    # If the active provider is in the extended list, promote it into top
+    if active and active in extended_keys:
+        promoted = [(k, l) for k, l in extended_providers if k == active]
+        extended_providers = [(k, l) for k, l in extended_providers if k != active]
+        top_providers = promoted + top_providers
+        top_keys.add(active)
 
-    # Reorder so the active provider is at the top
-    known_keys = {k for k, _ in providers}
-    active_key = active if active in known_keys else "custom"
+    # Build the primary menu
     ordered = []
-    for key, label in providers:
-        if key == active_key:
-            ordered.insert(0, (key, f"{label}  ← currently active"))
+    default_idx = 0
+    for key, label in top_providers:
+        if active and key == active:
+            ordered.append((key, f"{label}  ← currently active"))
+            default_idx = len(ordered) - 1
         else:
             ordered.append((key, label))
+
+    ordered.append(("more", "More providers..."))
     ordered.append(("cancel", "Cancel"))
 
-    provider_idx = _prompt_provider_choice([label for _, label in ordered])
+    provider_idx = _prompt_provider_choice(
+        [label for _, label in ordered], default=default_idx,
+    )
     if provider_idx is None or ordered[provider_idx][0] == "cancel":
         print("No change.")
         return
 
     selected_provider = ordered[provider_idx][0]
+
+    # "More providers..." — show the extended list
+    if selected_provider == "more":
+        ext_ordered = list(extended_providers)
+        ext_ordered.append(("custom", "Custom endpoint (enter URL manually)"))
+        if _custom_provider_map:
+            ext_ordered.append(("remove-custom", "Remove a saved custom provider"))
+        ext_ordered.append(("cancel", "Cancel"))
+
+        ext_idx = _prompt_provider_choice(
+            [label for _, label in ext_ordered], default=0,
+        )
+        if ext_idx is None or ext_ordered[ext_idx][0] == "cancel":
+            print("No change.")
+            return
+        selected_provider = ext_ordered[ext_idx][0]
 
     # Step 2: Provider-specific setup + model selection
     if selected_provider == "openrouter":
@@ -1030,38 +1057,37 @@ def select_provider_and_model(args=None):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
+    elif selected_provider in ("gemini", "zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
-def _prompt_provider_choice(choices):
-    """Show provider selection menu. Returns index or None."""
+def _prompt_provider_choice(choices, *, default=0):
+    """Show provider selection menu with curses arrow-key navigation.
+
+    Falls back to a numbered list when curses is unavailable (e.g. piped
+    stdin, non-TTY environments).  Returns the selected index, or None
+    if the user cancels.
+    """
     try:
-        from simple_term_menu import TerminalMenu
-        menu_items = [f"  {c}" for c in choices]
-        menu = TerminalMenu(
-            menu_items, cursor_index=0,
-            menu_cursor="-> ", menu_cursor_style=("fg_green", "bold"),
-            menu_highlight_style=("fg_green",),
-            cycle_cursor=True, clear_screen=False,
-            title="Select provider:",
-        )
-        idx = menu.show()
-        print()
-        return idx
-    except (ImportError, NotImplementedError):
+        from hermes_cli.setup import _curses_prompt_choice
+        idx = _curses_prompt_choice("Select provider:", choices, default)
+        if idx >= 0:
+            print()
+            return idx
+    except Exception:
         pass
 
     # Fallback: numbered list
     print("Select provider:")
     for i, c in enumerate(choices, 1):
-        print(f"  {i}. {c}")
+        marker = "→" if i - 1 == default else " "
+        print(f"  {marker} {i}. {c}")
     print()
     while True:
         try:
-            val = input(f"Choice [1-{len(choices)}]: ").strip()
+            val = input(f"Choice [1-{len(choices)}] ({default + 1}): ").strip()
             if not val:
-                return None
+                return default
             idx = int(val) - 1
             if 0 <= idx < len(choices):
                 return idx
@@ -1084,7 +1110,8 @@ def _model_flow_openrouter(config, current_model=""):
         print("Get one at: https://openrouter.ai/keys")
         print()
         try:
-            key = input("OpenRouter API key (or Enter to cancel): ").strip()
+            import getpass
+            key = getpass.getpass("OpenRouter API key (or Enter to cancel): ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             return
@@ -1307,7 +1334,8 @@ def _model_flow_custom(config):
 
     try:
         base_url = input(f"API base URL [{current_url or 'e.g. https://api.example.com/v1'}]: ").strip()
-        api_key = input(f"API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
+        import getpass
+        api_key = getpass.getpass(f"API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
         return
@@ -1816,7 +1844,8 @@ def _model_flow_copilot(config, current_model=""):
                 return
         elif choice == "2":
             try:
-                new_key = input("  Token (COPILOT_GITHUB_TOKEN): ").strip()
+                import getpass
+                new_key = getpass.getpass("  Token (COPILOT_GITHUB_TOKEN): ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()
                 return
@@ -2057,7 +2086,8 @@ def _model_flow_kimi(config, current_model=""):
         print(f"No {pconfig.name} API key configured.")
         if key_env:
             try:
-                new_key = input(f"{key_env} (or Enter to cancel): ").strip()
+                import getpass
+                new_key = getpass.getpass(f"{key_env} (or Enter to cancel): ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()
                 return
@@ -2151,7 +2181,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         print(f"No {pconfig.name} API key configured.")
         if key_env:
             try:
-                new_key = input(f"{key_env} (or Enter to cancel): ").strip()
+                import getpass
+                new_key = getpass.getpass(f"{key_env} (or Enter to cancel): ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()
                 return
@@ -2180,24 +2211,37 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         save_env_value(base_url_env, override)
         effective_base = override
 
-    # Model selection — try live /models endpoint first, fall back to defaults.
-    # Providers with large live catalogs (100+ models) use a curated list instead
-    # so users see familiar model names rather than an overwhelming dump.
+    # Model selection — resolution order:
+    #   1. models.dev registry (cached, filtered for agentic/tool-capable models)
+    #   2. Curated static fallback list (offline insurance)
+    #   3. Live /models endpoint probe (small providers without models.dev data)
     curated = _PROVIDER_MODELS.get(provider_id, [])
-    if curated and len(curated) >= 8:
+
+    # Try models.dev first — returns tool-capable models, filtered for noise
+    mdev_models: list = []
+    try:
+        from agent.models_dev import list_agentic_models
+        mdev_models = list_agentic_models(provider_id)
+    except Exception:
+        pass
+
+    if mdev_models:
+        model_list = mdev_models
+        print(f"  Found {len(model_list)} model(s) from models.dev registry")
+    elif curated and len(curated) >= 8:
         # Curated list is substantial — use it directly, skip live probe
-        live_models = None
+        model_list = curated
+        print(f"  Showing {len(model_list)} curated models — use \"Enter custom model name\" for others.")
     else:
         api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
         live_models = fetch_api_models(api_key_for_probe, effective_base)
-
-    if live_models and len(live_models) >= len(curated):
-        model_list = live_models
-        print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
-    else:
-        model_list = curated
-        if model_list:
-            print(f"  Showing {len(model_list)} curated models — use \"Enter custom model name\" for others.")
+        if live_models and len(live_models) >= len(curated):
+            model_list = live_models
+            print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
+        else:
+            model_list = curated
+            if model_list:
+                print(f"  Showing {len(model_list)} curated models — use \"Enter custom model name\" for others.")
         # else: no defaults either, will fall through to raw input
 
     if provider_id in {"opencode-zen", "opencode-go"}:
@@ -2285,7 +2329,8 @@ def _run_anthropic_oauth_flow(save_env_value):
         print("  If the setup-token was displayed above, paste it here:")
         print()
         try:
-            manual_token = input("  Paste setup-token (or Enter to cancel): ").strip()
+            import getpass
+            manual_token = getpass.getpass("  Paste setup-token (or Enter to cancel): ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             return False
@@ -2312,7 +2357,8 @@ def _run_anthropic_oauth_flow(save_env_value):
         print("  Or paste an existing setup-token now (sk-ant-oat-...):")
         print()
         try:
-            token = input("  Setup-token (or Enter to cancel): ").strip()
+            import getpass
+            token = getpass.getpass("  Setup-token (or Enter to cancel): ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             return False
@@ -2405,7 +2451,8 @@ def _model_flow_anthropic(config, current_model=""):
             print("  Get an API key at: https://console.anthropic.com/settings/keys")
             print()
             try:
-                api_key = input("  API key (sk-ant-...): ").strip()
+                import getpass
+                api_key = getpass.getpass("  API key (sk-ant-...): ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()
                 return
@@ -4150,7 +4197,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "gemini", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
         default=None,
         help="Inference provider (default: auto)"
     )

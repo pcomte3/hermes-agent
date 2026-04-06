@@ -5224,11 +5224,13 @@ class AIAgent:
         return transformed
 
     def _anthropic_preserve_dots(self) -> bool:
-        """True when using Alibaba/DashScope anthropic-compatible endpoint (model names keep dots, e.g. qwen3.5-plus)."""
-        if (getattr(self, "provider", "") or "").lower() == "alibaba":
+        """True when using an anthropic-compatible endpoint that preserves dots in model names.
+        Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
+        OpenCode Go keeps dots (e.g. minimax-m2.7)."""
+        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "opencode-go"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base
+        return "dashscope" in base or "aliyuncs" in base or "opencode.ai/zen/go" in base
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
@@ -5435,6 +5437,12 @@ class AIAgent:
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
+
+        # xAI prompt caching: send x-grok-conv-id header to route requests
+        # to the same server, maximizing automatic cache hits.
+        # https://docs.x.ai/developers/advanced-api-usage/prompt-caching
+        if "x.ai" in self._base_url_lower and hasattr(self, "session_id") and self.session_id:
+            api_kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
 
         return api_kwargs
 
