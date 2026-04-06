@@ -52,6 +52,25 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Non-agentic model warning
+# ---------------------------------------------------------------------------
+
+_HERMES_MODEL_WARNING = (
+    "Nous Research Hermes 3 & 4 models are NOT agentic and are not designed "
+    "for use with Hermes Agent. They lack the tool-calling capabilities "
+    "required for agent workflows. Consider using an agentic model instead "
+    "(Claude, GPT, Gemini, DeepSeek, etc.)."
+)
+
+
+def _check_hermes_model_warning(model_name: str) -> str:
+    """Return a warning string if *model_name* looks like a Hermes LLM model."""
+    if "hermes" in model_name.lower():
+        return _HERMES_MODEL_WARNING
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Model aliases -- short names -> (vendor, family) with NO version numbers.
 # Resolved dynamically against the live models.dev catalog.
 # ---------------------------------------------------------------------------
@@ -400,14 +419,25 @@ def switch_model(
         # Resolve the provider
         pdef = resolve_provider_full(explicit_provider, user_providers)
         if pdef is None:
+            _switch_err = (
+                f"Unknown provider '{explicit_provider}'. "
+                f"Check 'hermes model' for available providers, or define it "
+                f"in config.yaml under 'providers:'."
+            )
+            # Check for common config issues that cause provider resolution failures
+            try:
+                from hermes_cli.config import validate_config_structure
+                _cfg_issues = validate_config_structure()
+                if _cfg_issues:
+                    _switch_err += "\n\nRun 'hermes doctor' — config issues detected:"
+                    for _ci in _cfg_issues[:3]:
+                        _switch_err += f"\n  • {_ci.message}"
+            except Exception:
+                pass
             return ModelSwitchResult(
                 success=False,
                 is_global=is_global,
-                error_message=(
-                    f"Unknown provider '{explicit_provider}'. "
-                    f"Check 'hermes model' for available providers, or define it "
-                    f"in config.yaml under 'providers:'."
-                ),
+                error_message=_switch_err,
             )
 
         target_provider = pdef.id
@@ -619,6 +649,14 @@ def switch_model(
     # --- Get full model info from models.dev ---
     model_info = get_model_info(target_provider, new_model)
 
+    # --- Collect warnings ---
+    warnings: list[str] = []
+    if validation.get("message"):
+        warnings.append(validation["message"])
+    hermes_warn = _check_hermes_model_warning(new_model)
+    if hermes_warn:
+        warnings.append(hermes_warn)
+
     # --- Build result ---
     return ModelSwitchResult(
         success=True,
@@ -628,7 +666,7 @@ def switch_model(
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
-        warning_message=validation.get("message") or "",
+        warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,
