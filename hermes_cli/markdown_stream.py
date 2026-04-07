@@ -328,11 +328,21 @@ class MarkdownStreamProcessor:
         for esc_seq, sentinel in _ESCAPE_MAP.items():
             line = line.replace(esc_seq, sentinel)
 
-        # 2. Full-line patterns (header, HR) — if matched, skip inline transforms
+        # 2. Full-line patterns (header, HR) — if matched, apply inline
+        #    formatting to the header text (strip bold/italic/code markers).
         m = _RE_HEADER.match(line)
         if m:
             level = len(m.group(1))
             text = m.group(2)
+            # Strip inline markers from header text — the header itself is
+            # already bold, so **bold** inside just needs markers removed.
+            text = _RE_BOLD_ITALIC.sub(r"\1", text)
+            text = _RE_BOLD_STAR.sub(r"\1", text)
+            text = _RE_BOLD_UNDER.sub(r"\1", text)
+            text = _RE_ITALIC_STAR.sub(r"\1", text)
+            text = _RE_ITALIC_UNDER.sub(r"\1", text)
+            text = _RE_STRIKETHROUGH.sub(r"\1", text)
+            text = _RE_INLINE_CODE.sub(r"\1", text)
             if level == 1:
                 line = f"{_BOLD}{_UNDERLINE}{text}{rst}{base}"
             elif level == 2:
