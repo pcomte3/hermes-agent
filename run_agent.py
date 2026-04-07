@@ -5749,7 +5749,6 @@ class AIAgent:
                     tools=[memory_tool_def],
                     temperature=0.3,
                     max_tokens=5120,
-                    timeout=30.0,
                 )
             except RuntimeError:
                 _aux_available = False
@@ -5781,7 +5780,7 @@ class AIAgent:
                     "temperature": 0.3,
                     **self._max_tokens_param(5120),
                 }
-                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(**api_kwargs, timeout=30.0)
+                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(**api_kwargs)
 
             # Extract tool calls from the response, handling all API formats
             tool_calls = []
