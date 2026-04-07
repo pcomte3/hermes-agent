@@ -1121,7 +1121,7 @@ def launchd_start():
     try:
         subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
     except subprocess.CalledProcessError as e:
-        if e.returncode != 3:
+        if e.returncode not in (3, 113):
             raise
         print("↻ launchd job was unloaded; reloading service definition")
         subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
@@ -1183,7 +1183,7 @@ def launchd_restart():
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:
-        if e.returncode != 3:
+        if e.returncode not in (3, 113):
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
@@ -1803,8 +1803,7 @@ def _setup_signal():
         print_warning("signal-cli not found on PATH.")
         print_info("  Signal requires signal-cli running as an HTTP daemon.")
         print_info("  Install options:")
-        print_info("    Linux:  sudo apt install signal-cli")
-        print_info("            or download from https://github.com/AsamK/signal-cli")
+        print_info("    Linux:  download from https://github.com/AsamK/signal-cli/releases")
         print_info("    macOS:  brew install signal-cli")
         print_info("    Docker: bbernhard/signal-cli-rest-api")
         print()

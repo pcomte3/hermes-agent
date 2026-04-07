@@ -701,6 +701,15 @@ class MattermostAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Mattermost: error downloading file %s: %s", fid, exc)
 
+        # Set message type based on downloaded media types.
+        if media_types and msg_type == MessageType.TEXT:
+            if any(m.startswith("image/") for m in media_types):
+                msg_type = MessageType.PHOTO
+            elif any(m.startswith("audio/") for m in media_types):
+                msg_type = MessageType.VOICE
+            elif media_types:
+                msg_type = MessageType.DOCUMENT
+
         source = self.build_source(
             chat_id=channel_id,
             chat_type=chat_type,

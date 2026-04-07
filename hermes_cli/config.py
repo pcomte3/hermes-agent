@@ -42,7 +42,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
-    "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_HOME_ROOM",
+    "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
     "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD",
 })
 import yaml
@@ -870,6 +870,13 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "FIRECRAWL_BROWSER_TTL": {
+        "description": "Firecrawl browser session TTL in seconds (optional, default 300)",
+        "prompt": "Browser session TTL (seconds)",
+        "tools": ["browser_navigate", "browser_click"],
+        "password": False,
+        "category": "tool",
+    },
     "CAMOFOX_URL": {
         "description": "Camofox browser server URL for local anti-detection browsing (e.g. http://localhost:9377)",
         "prompt": "Camofox server URL",
@@ -1074,6 +1081,14 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "MATRIX_DEVICE_ID": {
+        "description": "Stable Matrix device ID for E2EE persistence across restarts (e.g. HERMES_BOT)",
+        "prompt": "Matrix device ID (stable across restarts)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
     "GATEWAY_ALLOW_ALL_USERS": {
         "description": "Allow all users to interact with messaging bots (true/false). Default: false.",
         "prompt": "Allow all users (true/false)",
@@ -1263,6 +1278,43 @@ def get_missing_config_fields() -> List[Dict[str, Any]]:
                 _check(default_value, current[key], full_key)
 
     _check(DEFAULT_CONFIG, config)
+    return missing
+
+
+def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
+    """Return skill-declared config vars that are missing or empty in config.yaml.
+
+    Scans all enabled skills for ``metadata.hermes.config`` entries, then checks
+    which ones are absent or empty under ``skills.config.<key>`` in the user's
+    config.yaml.  Returns a list of dicts suitable for prompting.
+    """
+    try:
+        from agent.skill_utils import discover_all_skill_config_vars, SKILL_CONFIG_PREFIX
+    except Exception:
+        return []
+
+    all_vars = discover_all_skill_config_vars()
+    if not all_vars:
+        return []
+
+    config = load_config()
+    missing: List[Dict[str, Any]] = []
+    for var in all_vars:
+        # Skill config is stored under skills.config.<logical_key>
+        storage_key = f"{SKILL_CONFIG_PREFIX}.{var['key']}"
+        parts = storage_key.split(".")
+        current = config
+        value = None
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+                value = current
+            else:
+                value = None
+                break
+        # Missing = key doesn't exist or is empty string
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.append(var)
     return missing
 
 
@@ -1697,7 +1749,50 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         config = load_config()
         config["_config_version"] = latest_ver
         save_config(config)
-    
+
+    # ── Skill-declared config vars ──────────────────────────────────────
+    # Skills can declare config.yaml settings they need via
+    # metadata.hermes.config in their SKILL.md frontmatter.
+    # Prompt for any that are missing/empty.
+    missing_skill_config = get_missing_skill_config_vars()
+    if missing_skill_config and interactive and not quiet:
+        print(f"\n  {len(missing_skill_config)} skill setting(s) not configured:")
+        for var in missing_skill_config:
+            skill_name = var.get("skill", "unknown")
+            print(f"    • {var['key']} — {var['description']} (from skill: {skill_name})")
+        print()
+        try:
+            answer = input("  Configure skill settings? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+
+        if answer in ("y", "yes"):
+            print()
+            config = load_config()
+            try:
+                from agent.skill_utils import SKILL_CONFIG_PREFIX
+            except Exception:
+                SKILL_CONFIG_PREFIX = "skills.config"
+            for var in missing_skill_config:
+                default = var.get("default", "")
+                default_hint = f" (default: {default})" if default else ""
+                value = input(f"  {var['prompt']}{default_hint}: ").strip()
+                if not value and default:
+                    value = str(default)
+                if value:
+                    storage_key = f"{SKILL_CONFIG_PREFIX}.{var['key']}"
+                    _set_nested(config, storage_key, value)
+                    results["config_added"].append(var["key"])
+                    print(f"  ✓ Saved {var['key']} = {value}")
+                else:
+                    results["warnings"].append(
+                        f"Skipped {var['key']} — skill '{var.get('skill', '?')}' may ask for it later"
+                    )
+                print()
+            save_config(config)
+        else:
+            print("  Set later with: hermes config set <key> <value>")
+
     return results
 
 
@@ -1839,8 +1934,8 @@ _FALLBACK_COMMENT = """
 #
 # Supported providers:
 #   openrouter   (OPENROUTER_API_KEY)  — routes to any model
-#   openai-codex (OAuth — hermes login) — OpenAI Codex
-#   nous         (OAuth — hermes login) — Nous Portal
+#   openai-codex (OAuth — hermes auth) — OpenAI Codex
+#   nous         (OAuth — hermes auth) — Nous Portal
 #   zai          (ZAI_API_KEY)         — Z.AI / GLM
 #   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
 #   minimax      (MINIMAX_API_KEY)     — MiniMax
@@ -1882,8 +1977,8 @@ _COMMENTED_SECTIONS = """
 #
 # Supported providers:
 #   openrouter   (OPENROUTER_API_KEY)  — routes to any model
-#   openai-codex (OAuth — hermes login) — OpenAI Codex
-#   nous         (OAuth — hermes login) — Nous Portal
+#   openai-codex (OAuth — hermes auth) — OpenAI Codex
+#   nous         (OAuth — hermes auth) — Nous Portal
 #   zai          (ZAI_API_KEY)         — Z.AI / GLM
 #   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
 #   minimax      (MINIMAX_API_KEY)     — MiniMax
@@ -2351,6 +2446,23 @@ def show_config():
     print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
     print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
     
+    # Skill config
+    try:
+        from agent.skill_utils import discover_all_skill_config_vars, resolve_skill_config_values
+        skill_vars = discover_all_skill_config_vars()
+        if skill_vars:
+            resolved = resolve_skill_config_values(skill_vars)
+            print()
+            print(color("◆ Skill Settings", Colors.CYAN, Colors.BOLD))
+            for var in skill_vars:
+                key = var["key"]
+                value = resolved.get(key, "")
+                skill_name = var.get("skill", "")
+                display_val = str(value) if value else color("(not set)", Colors.DIM)
+                print(f"  {key:<20s} {display_val}  {color(f'[{skill_name}]', Colors.DIM)}")
+    except Exception:
+        pass
+
     print()
     print(color("─" * 60, Colors.DIM))
     print(color("  hermes config edit     # Edit config file", Colors.DIM))
