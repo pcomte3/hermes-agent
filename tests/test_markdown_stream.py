@@ -125,6 +125,30 @@ class TestHeaders:
         assert "Deepest" in _strip_ansi(out)
         assert "#" not in _strip_ansi(out)
 
+    def test_header_strips_inline_bold(self):
+        """Bold markers inside headers should be stripped, not shown literally."""
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("### 1. **set_context.sh - Bug**")
+        plain = _strip_ansi(out)
+        assert "set_context.sh - Bug" in plain
+        assert "**" not in plain
+
+    def test_header_strips_inline_code(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("## Using `foo()` in production")
+        plain = _strip_ansi(out)
+        assert "foo()" in plain
+        assert "`" not in plain
+
+    def test_header_strips_mixed_inline(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("# **Bold** and *italic* and `code`")
+        plain = _strip_ansi(out)
+        assert "Bold and italic and code" in plain
+        assert "**" not in plain
+        assert "*" not in plain
+        assert "`" not in plain
+
 
 class TestBlockquote:
     def test_blockquote(self):
