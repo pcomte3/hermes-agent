@@ -3444,7 +3444,22 @@ class AIAgent:
         """Normalize a Responses API object to an assistant_message-like object."""
         output = getattr(response, "output", None)
         if not isinstance(output, list) or not output:
-            raise RuntimeError("Responses API returned no output items")
+            # The Codex backend can return empty output when the answer was
+            # delivered entirely via stream events. Check output_text as a
+            # last-resort fallback before raising.
+            out_text = getattr(response, "output_text", None)
+            if isinstance(out_text, str) and out_text.strip():
+                logger.debug(
+                    "Codex response has empty output but output_text is present (%d chars); "
+                    "synthesizing output item.", len(out_text.strip()),
+                )
+                output = [SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[SimpleNamespace(type="output_text", text=out_text.strip())],
+                )]
+                response.output = output
+            else:
+                raise RuntimeError("Responses API returned no output items")
 
         response_status = getattr(response, "status", None)
         if isinstance(response_status, str):
@@ -3868,7 +3883,12 @@ class AIAgent:
         has_tool_calls = False
         first_delta_fired = False
         self._reasoning_deltas_fired = False
+        # Accumulate streamed text so we can recover if get_final_response()
+        # returns empty output (e.g. chatgpt.com backend-api sends
+        # response.incomplete instead of response.completed).
+        self._codex_streamed_text_parts: list = []
         for attempt in range(max_stream_retries + 1):
+            collected_output_items: list = []
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
@@ -3878,6 +3898,8 @@ class AIAgent:
                         # Fire callbacks on text content deltas (suppress during tool calls)
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
+                            if delta_text:
+                                self._codex_streamed_text_parts.append(delta_text)
                             if delta_text and not has_tool_calls:
                                 if not first_delta_fired:
                                     first_delta_fired = True
@@ -3895,7 +3917,51 @@ class AIAgent:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
                                 self._fire_reasoning_delta(reasoning_text)
-                    return stream.get_final_response()
+                        # Collect completed output items — some backends
+                        # (chatgpt.com/backend-api/codex) stream valid items
+                        # via response.output_item.done but the SDK's
+                        # get_final_response() returns an empty output list.
+                        elif event_type == "response.output_item.done":
+                            done_item = getattr(event, "item", None)
+                            if done_item is not None:
+                                collected_output_items.append(done_item)
+                        # Log non-completed terminal events for diagnostics
+                        elif event_type in ("response.incomplete", "response.failed"):
+                            resp_obj = getattr(event, "response", None)
+                            status = getattr(resp_obj, "status", None) if resp_obj else None
+                            incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
+                            logger.warning(
+                                "Codex Responses stream received terminal event %s "
+                                "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
+                                event_type, status, incomplete_details,
+                                sum(len(p) for p in self._codex_streamed_text_parts),
+                                self._client_log_context(),
+                            )
+                    final_response = stream.get_final_response()
+                    # PATCH: ChatGPT Codex backend streams valid output items
+                    # but get_final_response() can return an empty output list.
+                    # Backfill from collected items or synthesize from deltas.
+                    _out = getattr(final_response, "output", None)
+                    if isinstance(_out, list) and not _out:
+                        if collected_output_items:
+                            final_response.output = list(collected_output_items)
+                            logger.debug(
+                                "Codex stream: backfilled %d output items from stream events",
+                                len(collected_output_items),
+                            )
+                        elif self._codex_streamed_text_parts and not has_tool_calls:
+                            assembled = "".join(self._codex_streamed_text_parts)
+                            final_response.output = [SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )]
+                            logger.debug(
+                                "Codex stream: synthesized output from %d text deltas (%d chars)",
+                                len(self._codex_streamed_text_parts), len(assembled),
+                            )
+                    return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -3946,11 +4012,28 @@ class AIAgent:
             return stream_or_response
 
         terminal_response = None
+        collected_output_items: list = []
+        collected_text_deltas: list = []
         try:
             for event in stream_or_response:
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
+
+                # Collect output items and text deltas for backfill
+                if event_type == "response.output_item.done":
+                    done_item = getattr(event, "item", None)
+                    if done_item is None and isinstance(event, dict):
+                        done_item = event.get("item")
+                    if done_item is not None:
+                        collected_output_items.append(done_item)
+                elif event_type in ("response.output_text.delta",):
+                    delta = getattr(event, "delta", "")
+                    if not delta and isinstance(event, dict):
+                        delta = event.get("delta", "")
+                    if delta:
+                        collected_text_deltas.append(delta)
+
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue
 
@@ -3958,6 +4041,26 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
+                    # Backfill empty output from collected stream events
+                    _out = getattr(terminal_response, "output", None)
+                    if isinstance(_out, list) and not _out:
+                        if collected_output_items:
+                            terminal_response.output = list(collected_output_items)
+                            logger.debug(
+                                "Codex fallback stream: backfilled %d output items",
+                                len(collected_output_items),
+                            )
+                        elif collected_text_deltas:
+                            assembled = "".join(collected_text_deltas)
+                            terminal_response.output = [SimpleNamespace(
+                                type="message", role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )]
+                            logger.debug(
+                                "Codex fallback stream: synthesized from %d deltas (%d chars)",
+                                len(collected_text_deltas), len(assembled),
+                            )
                     return terminal_response
         finally:
             close_fn = getattr(stream_or_response, "close", None)
@@ -7365,6 +7468,18 @@ class AIAgent:
                             response_invalid = True
                             error_details.append("response.output is not a list")
                         elif len(output_items) == 0:
+                            # If we reach here, _run_codex_stream's backfill
+                            # from output_item.done events and text-delta
+                            # synthesis both failed to populate output.
+                            _resp_status = getattr(response, "status", None)
+                            _resp_incomplete = getattr(response, "incomplete_details", None)
+                            logging.warning(
+                                "Codex response.output is empty after stream backfill "
+                                "(status=%s, incomplete_details=%s, model=%s). %s",
+                                _resp_status, _resp_incomplete,
+                                getattr(response, "model", None),
+                                f"api_mode={self.api_mode} provider={self.provider}",
+                            )
                             response_invalid = True
                             error_details.append("response.output is empty")
                     elif self.api_mode == "anthropic_messages":
@@ -8186,11 +8301,17 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
                         # Actionable guidance for common auth errors
                         if status_code in (401, 403) or "unauthorized" in error_msg or "forbidden" in error_msg or "permission" in error_msg:
-                            self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
-                            self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
-                            self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
-                            if "openrouter" in str(_base).lower():
-                                self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
+                            if _provider == "openai-codex" and status_code == 401:
+                                self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
+                                self._vprint(f"{self.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
+                                self._vprint(f"{self.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
+                                self._vprint(f"{self.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
+                            else:
+                                self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
+                                self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
+                                self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
+                                if "openrouter" in str(_base).lower():
+                                    self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")

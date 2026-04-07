@@ -120,6 +120,63 @@ def _parse_reasoning_config(effort: str) -> dict | None:
     return result
 
 
+def _get_chrome_debug_candidates(system: str) -> list[str]:
+    """Return likely browser executables for local CDP auto-launch."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add_candidate(path: str | None) -> None:
+        if not path:
+            return
+        normalized = os.path.normcase(os.path.normpath(path))
+        if normalized in seen:
+            return
+        if os.path.isfile(path):
+            candidates.append(path)
+            seen.add(normalized)
+
+    def _add_from_path(*names: str) -> None:
+        for name in names:
+            _add_candidate(shutil.which(name))
+
+    if system == "Darwin":
+        for app in (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ):
+            _add_candidate(app)
+    elif system == "Windows":
+        _add_from_path(
+            "chrome.exe", "msedge.exe", "brave.exe", "chromium.exe",
+            "chrome", "msedge", "brave", "chromium",
+        )
+
+        for base in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ):
+            if not base:
+                continue
+            for parts in (
+                ("Google", "Chrome", "Application", "chrome.exe"),
+                ("Chromium", "Application", "chrome.exe"),
+                ("Chromium", "Application", "chromium.exe"),
+                ("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                ("Microsoft", "Edge", "Application", "msedge.exe"),
+            ):
+                _add_candidate(os.path.join(base, *parts))
+    else:
+        _add_from_path(
+            "google-chrome", "google-chrome-stable", "chromium-browser",
+            "chromium", "brave-browser", "microsoft-edge",
+        )
+
+    return candidates
+
+
 def load_cli_config() -> Dict[str, Any]:
     """
     Load CLI configuration from config files.
@@ -3768,7 +3825,7 @@ class HermesCLI:
 
         # Persistence
         if persist_global:
-            save_config_value("model.name", result.new_model)
+            save_config_value("model.default", result.new_model)
             if result.provider_changed:
                 save_config_value("model.provider", result.target_provider)
             _cprint("    Saved to config.yaml (--global)")
@@ -4900,27 +4957,9 @@ class HermesCLI:
 
         Returns True if a launch command was executed (doesn't guarantee success).
         """
-        import shutil
         import subprocess as _sp
 
-        candidates = []
-        if system == "Darwin":
-            # macOS: try common app bundle locations
-            for app in (
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            ):
-                if os.path.isfile(app):
-                    candidates.append(app)
-        else:
-            # Linux: try common binary names
-            for name in ("google-chrome", "google-chrome-stable", "chromium-browser",
-                         "chromium", "brave-browser", "microsoft-edge"):
-                path = shutil.which(name)
-                if path:
-                    candidates.append(path)
+        candidates = _get_chrome_debug_candidates(system)
 
         if not candidates:
             return False
@@ -7536,18 +7575,26 @@ class HermesCLI:
         # wrapping of long lines so the input area always fits its content.
         def _input_height():
             try:
+                from prompt_toolkit.application import get_app
+                from prompt_toolkit.utils import get_cwidth
+
                 doc = input_area.buffer.document
-                prompt_width = max(2, len(self._get_tui_prompt_text()))
-                available_width = shutil.get_terminal_size().columns - prompt_width
+                prompt_width = max(2, get_cwidth(self._get_tui_prompt_text()))
+                try:
+                    available_width = get_app().output.get_size().columns - prompt_width
+                except Exception:
+                    available_width = shutil.get_terminal_size((80, 24)).columns - prompt_width
                 if available_width < 10:
                     available_width = 40
                 visual_lines = 0
                 for line in doc.lines:
-                    # Each logical line takes at least 1 visual row; long lines wrap
-                    if len(line) == 0:
+                    # Each logical line takes at least 1 visual row; long lines wrap.
+                    # Use prompt_toolkit's cell width so CJK wide characters count as 2.
+                    line_width = get_cwidth(line)
+                    if line_width <= 0:
                         visual_lines += 1
                     else:
-                        visual_lines += max(1, -(-len(line) // available_width))  # ceil division
+                        visual_lines += max(1, -(-line_width // available_width))  # ceil division
                 return min(max(visual_lines, 1), 8)
             except Exception:
                 return 1
