@@ -66,6 +66,22 @@ _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|.*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|[\s:?-]+(\|[\s:?-]+)+\|\s*$")
 
 
+def _strip_inline_markers(text: str) -> str:
+    """Remove inline markdown markers (**bold**, *italic*, `code`, ~~strike~~).
+
+    Used for headers and table cells where the surrounding context already
+    provides styling — we just need to remove the raw marker characters.
+    """
+    text = _RE_BOLD_ITALIC.sub(r"\1", text)
+    text = _RE_BOLD_STAR.sub(r"\1", text)
+    text = _RE_BOLD_UNDER.sub(r"\1", text)
+    text = _RE_ITALIC_STAR.sub(r"\1", text)
+    text = _RE_ITALIC_UNDER.sub(r"\1", text)
+    text = _RE_STRIKETHROUGH.sub(r"\1", text)
+    text = _RE_INLINE_CODE.sub(r"\1", text)
+    return text
+
+
 # ---------------------------------------------------------------------------
 # MarkdownStreamProcessor
 # ---------------------------------------------------------------------------
@@ -255,7 +271,7 @@ class MarkdownStreamProcessor:
                 row = row[1:]
             if row.endswith("|"):
                 row = row[:-1]
-            cells = [c.strip() for c in row.split("|")]
+            cells = [_strip_inline_markers(c.strip()) for c in row.split("|")]
             parsed.append(cells)
             if _TABLE_SEP_RE.match(self._table_rows[i]):
                 sep_indices.add(i)
@@ -334,15 +350,7 @@ class MarkdownStreamProcessor:
         if m:
             level = len(m.group(1))
             text = m.group(2)
-            # Strip inline markers from header text — the header itself is
-            # already bold, so **bold** inside just needs markers removed.
-            text = _RE_BOLD_ITALIC.sub(r"\1", text)
-            text = _RE_BOLD_STAR.sub(r"\1", text)
-            text = _RE_BOLD_UNDER.sub(r"\1", text)
-            text = _RE_ITALIC_STAR.sub(r"\1", text)
-            text = _RE_ITALIC_UNDER.sub(r"\1", text)
-            text = _RE_STRIKETHROUGH.sub(r"\1", text)
-            text = _RE_INLINE_CODE.sub(r"\1", text)
+            text = _strip_inline_markers(text)
             if level == 1:
                 line = f"{_BOLD}{_UNDERLINE}{text}{rst}{base}"
             elif level == 2:

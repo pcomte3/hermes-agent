@@ -435,6 +435,20 @@ class TestTableRendering:
         data_lines = [l for l in lines if "│" in l and "─" not in l]
         assert len(data_lines) >= 2
 
+    def test_table_strips_inline_markers(self):
+        """Bold/italic/code markers in cells should be stripped."""
+        p = MarkdownStreamProcessor()
+        p.feed_line("| **Feature** | **Winner** |")
+        p.feed_line("|---|---|")
+        p.feed_line("| **Model Class** | **Qwen** |")
+        out = p.feed_line("done")
+        plain = _strip_ansi(out)
+        assert "Feature" in plain
+        assert "Winner" in plain
+        assert "Model Class" in plain
+        assert "Qwen" in plain
+        assert "**" not in plain
+
     def test_reset_clears_table(self):
         p = MarkdownStreamProcessor()
         p.feed_line("| A | B |")
