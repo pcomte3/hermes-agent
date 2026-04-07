@@ -46,90 +46,19 @@ _RESTORE_MAP = {v: k[1] for k, v in _ESCAPE_MAP.items()}  # sentinel -> literal 
 # Inline markdown regex transforms
 # ---------------------------------------------------------------------------
 
-def _build_inline_transforms():
-    """Build compiled regex transforms for inline markdown.
-
-    Returns a list of (compiled_regex, replacement_or_callable) tuples.
-    Applied in order to each normal-mode line.
-    """
-    transforms = []
-
-    # Headers: # through #### at start of line
-    transforms.append((
-        re.compile(r"^(#{1,4})\s+(.+)$"),
-        "_header",
-    ))
-
-    # Horizontal rule: --- or *** or ___ (3+ of the same char, optionally spaced)
-    transforms.append((
-        re.compile(r"^[\s]*[-*_]{3,}[\s]*$"),
-        "_hr",
-    ))
-
-    # Bold+italic: ***text*** or ___text___
-    transforms.append((
-        re.compile(r"(\*{3}|_{3})(?!\s)(.+?)(?<!\s)\1"),
-        "_bold_italic",
-    ))
-
-    # Bold: **text** or __text__
-    transforms.append((
-        re.compile(r"(\*{2}|_{2})(?!\s)(.+?)(?<!\s)\1"),
-        "_bold",
-    ))
-
-    # Italic: *text* (not inside words)
-    transforms.append((
-        re.compile(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)"),
-        "_italic_star",
-    ))
-
-    # Italic: _text_ (not inside words)
-    transforms.append((
-        re.compile(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)"),
-        "_italic_under",
-    ))
-
-    # Strikethrough: ~~text~~
-    transforms.append((
-        re.compile(r"~~(?!\s)(.+?)(?<!\s)~~"),
-        "_strikethrough",
-    ))
-
-    # Inline code: `code` (but NOT ``` fences)
-    transforms.append((
-        re.compile(r"(?<!`)`(?!`)([^`]+)`(?!`)"),
-        "_inline_code",
-    ))
-
-    # Links: [text](url)
-    transforms.append((
-        re.compile(r"\[([^\]]+)\]\(([^)]+)\)"),
-        "_link",
-    ))
-
-    # Blockquote: > text at start of line
-    transforms.append((
-        re.compile(r"^(\s*>\s?)(.*)$"),
-        "_blockquote",
-    ))
-
-    # Unordered list: -, *, + at start of line
-    transforms.append((
-        re.compile(r"^(\s*)([-*+])\s"),
-        "_ul_marker",
-    ))
-
-    # Ordered list: 1. 2. etc. at start of line
-    transforms.append((
-        re.compile(r"^(\s*)(\d+\.)\s"),
-        "_ol_marker",
-    ))
-
-    return transforms
-
-
-_INLINE_TRANSFORMS = _build_inline_transforms()
+_RE_HEADER = re.compile(r"^(#{1,6})\s+(.+)$")
+_RE_HR = re.compile(r"^[\s]*[-*_]{3,}[\s]*$")
+_RE_INLINE_CODE = re.compile(r"(?<!`)`(?!`)([^`]+)`(?!`)")
+_RE_BOLD_ITALIC = re.compile(r"\*{3}(\S(?:.*?\S)?)\*{3}")
+_RE_BOLD_STAR = re.compile(r"\*{2}(\S(?:.*?\S)?)\*{2}")
+_RE_BOLD_UNDER = re.compile(r"__(\S(?:.*?\S)?)__")
+_RE_ITALIC_STAR = re.compile(r"(?<!\w)\*(\S(?:.*?\S)?)\*(?!\w)")
+_RE_ITALIC_UNDER = re.compile(r"(?<!\w)_(\S(?:.*?\S)?)_(?!\w)")
+_RE_STRIKETHROUGH = re.compile(r"~~(\S(?:.*?\S)?)~~")
+_RE_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_RE_BLOCKQUOTE = re.compile(r"^(\s*>\s?)(.*)$")
+_RE_UL_MARKER = re.compile(r"^(\s*)([-*+])\s")
+_RE_OL_MARKER = re.compile(r"^(\s*)(\d+\.)\s")
 
 # Pipe-table row: starts and ends with | (after stripping), has at least one
 # inner |.  Also matches separator rows like |---|---|.
@@ -198,10 +127,21 @@ class MarkdownStreamProcessor:
             self._table_rows.clear()
 
         # -- Fence detection: ``` at start of line (after optional whitespace) --
-        if stripped.startswith("```"):
-            if not self._in_code_block:
+        # Only match lines that are JUST a fence: ```lang or ``` alone.
+        # Reject lines like "```text``` more stuff" or ```` (4+ backticks).
+        if stripped.startswith("```") and not stripped.startswith("````"):
+            _fence_rest = stripped[3:].strip()
+            _is_fence = (not _fence_rest                          # bare ```
+                         or re.match(r"^[a-zA-Z0-9_+-]+$", _fence_rest))  # ```lang
+
+            if _is_fence:
+                if self._in_code_block:
+                    # Closing fence
+                    self._exit_code_block()
+                    return self._render_fence_footer()
+
                 # Opening fence — extract language
-                lang = stripped[3:].strip().split()[0] if stripped[3:].strip() else ""
+                lang = _fence_rest or ""
 
                 # Skip ```markdown / ```md fences — LLMs often wrap entire
                 # responses in these.  Render the inner content as normal
@@ -219,10 +159,6 @@ class MarkdownStreamProcessor:
                 self._enter_code_block(lang)
                 fence = self._render_fence_header(lang)
                 return f"{table_output}\n{fence}" if table_output else fence
-            else:
-                # Closing fence
-                self._exit_code_block()
-                return self._render_fence_footer()
 
         if self._in_code_block:
             self._code_lines.append(line)
@@ -388,89 +324,84 @@ class MarkdownStreamProcessor:
         base = self._base
         rst = self._rst
 
-        # Escape backslash-escaped markdown characters
+        # 1. Escape backslash-escaped markdown characters
         for esc_seq, sentinel in _ESCAPE_MAP.items():
             line = line.replace(esc_seq, sentinel)
 
-        for pattern, handler_name in _INLINE_TRANSFORMS:
-            if handler_name == "_header":
-                m = pattern.match(line)
-                if m:
-                    level = len(m.group(1))
-                    text = m.group(2)
-                    # h1 = bold+underline, h2 = bold, h3/h4 = bold+dim
-                    if level == 1:
-                        line = f"{_BOLD}{_UNDERLINE}{text}{rst}{base}"
-                    elif level == 2:
-                        line = f"{_BOLD}{text}{rst}{base}"
-                    else:
-                        line = f"{_BOLD}{_DIM}{text}{rst}{base}"
-                    continue
+        # 2. Full-line patterns (header, HR) — if matched, skip inline transforms
+        m = _RE_HEADER.match(line)
+        if m:
+            level = len(m.group(1))
+            text = m.group(2)
+            if level == 1:
+                line = f"{_BOLD}{_UNDERLINE}{text}{rst}{base}"
+            elif level == 2:
+                line = f"{_BOLD}{text}{rst}{base}"
+            else:
+                line = f"{_BOLD}{_DIM}{text}{rst}{base}"
+            # Restore escaped chars and return early
+            for sentinel, literal in _RESTORE_MAP.items():
+                line = line.replace(sentinel, literal)
+            return f"{base}{line}{rst}" if base else line
 
-            elif handler_name == "_hr":
-                if pattern.match(line):
-                    w = shutil.get_terminal_size((80, 24)).columns
-                    line = f"{_DIM}{'─' * min(w - 4, 40)}{rst}{base}"
-                    continue
+        if _RE_HR.match(line):
+            w = shutil.get_terminal_size((80, 24)).columns
+            line = f"{_DIM}{'─' * min(w - 4, 40)}{rst}{base}"
+            for sentinel, literal in _RESTORE_MAP.items():
+                line = line.replace(sentinel, literal)
+            return f"{base}{line}{rst}" if base else line
 
-            elif handler_name == "_bold_italic":
-                line = pattern.sub(
-                    lambda m: f"{_BOLD_ITALIC}{m.group(2)}{rst}{base}", line
-                )
+        # 3. Protect inline code FIRST — extract `code` spans, replace with
+        #    sentinels so bold/italic regexes don't eat their content.
+        _code_spans: list[str] = []
+        _CODE_SENTINEL = "\ue010"
 
-            elif handler_name == "_bold":
-                line = pattern.sub(
-                    lambda m: f"{_BOLD}{m.group(2)}{rst}{base}", line
-                )
+        def _protect_code(m):
+            idx = len(_code_spans)
+            _code_spans.append(f"{_INLINE_CODE}{m.group(1)}{rst}{base}")
+            return f"{_CODE_SENTINEL}{idx}{_CODE_SENTINEL}"
 
-            elif handler_name == "_italic_star":
-                line = pattern.sub(
-                    lambda m: f"{_ITALIC}{m.group(1)}{rst}{base}", line
-                )
+        line = _RE_INLINE_CODE.sub(_protect_code, line)
 
-            elif handler_name == "_italic_under":
-                line = pattern.sub(
-                    lambda m: f"{_ITALIC}{m.group(1)}{rst}{base}", line
-                )
+        # 4. Links
+        line = _RE_LINK.sub(
+            lambda m: f"{_UNDERLINE}{m.group(1)}{rst}{_DIM} ({m.group(2)}){rst}{base}",
+            line,
+        )
 
-            elif handler_name == "_strikethrough":
-                line = pattern.sub(
-                    lambda m: f"{_STRIKETHROUGH}{m.group(1)}{rst}{base}", line
-                )
+        # 5. Bold+italic, bold, italic, strikethrough
+        line = _RE_BOLD_ITALIC.sub(lambda m: f"{_BOLD_ITALIC}{m.group(1)}{rst}{base}", line)
+        line = _RE_BOLD_STAR.sub(lambda m: f"{_BOLD}{m.group(1)}{rst}{base}", line)
+        line = _RE_BOLD_UNDER.sub(lambda m: f"{_BOLD}{m.group(1)}{rst}{base}", line)
+        line = _RE_ITALIC_STAR.sub(lambda m: f"{_ITALIC}{m.group(1)}{rst}{base}", line)
+        line = _RE_ITALIC_UNDER.sub(lambda m: f"{_ITALIC}{m.group(1)}{rst}{base}", line)
+        line = _RE_STRIKETHROUGH.sub(lambda m: f"{_STRIKETHROUGH}{m.group(1)}{rst}{base}", line)
 
-            elif handler_name == "_inline_code":
-                line = pattern.sub(
-                    lambda m: f"{_INLINE_CODE}{m.group(1)}{rst}{base}", line
-                )
+        # 6. Blockquote (full-line, but after inline transforms for content)
+        m = _RE_BLOCKQUOTE.match(line)
+        if m:
+            text = m.group(2)
+            line = f"{_DIM}  │ {_ITALIC}{text}{rst}{base}"
 
-            elif handler_name == "_link":
-                line = pattern.sub(
-                    lambda m: f"{_UNDERLINE}{m.group(1)}{rst}{_DIM} ({m.group(2)}){rst}{base}",
-                    line,
-                )
+        # 7. List markers
+        m = _RE_UL_MARKER.match(line)
+        if m:
+            indent = m.group(1)
+            rest = line[m.end():]
+            line = f"{indent}  • {rest}"
+        else:
+            m = _RE_OL_MARKER.match(line)
+            if m:
+                indent = m.group(1)
+                num = m.group(2)
+                rest = line[m.end():]
+                line = f"{indent}  {_DIM}{num}{rst}{base} {rest}"
 
-            elif handler_name == "_blockquote":
-                m = pattern.match(line)
-                if m:
-                    text = m.group(2)
-                    line = f"{_DIM}  │ {_ITALIC}{text}{rst}{base}"
+        # 8. Restore inline code sentinels
+        for i, rendered in enumerate(_code_spans):
+            line = line.replace(f"{_CODE_SENTINEL}{i}{_CODE_SENTINEL}", rendered)
 
-            elif handler_name == "_ul_marker":
-                m = pattern.match(line)
-                if m:
-                    indent = m.group(1)
-                    rest = line[m.end():]
-                    line = f"{indent}  • {rest}"
-
-            elif handler_name == "_ol_marker":
-                m = pattern.match(line)
-                if m:
-                    indent = m.group(1)
-                    num = m.group(2)
-                    rest = line[m.end():]
-                    line = f"{indent}  {_DIM}{num}{rst}{base} {rest}"
-
-        # Restore escaped characters
+        # 9. Restore escaped characters
         for sentinel, literal in _RESTORE_MAP.items():
             line = line.replace(sentinel, literal)
 

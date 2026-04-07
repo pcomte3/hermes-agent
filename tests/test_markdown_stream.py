@@ -112,6 +112,19 @@ class TestHeaders:
         out = p.feed_line("#### Subsection")
         assert "Subsection" in _strip_ansi(out)
 
+    def test_h5(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("##### Deep Section")
+        assert _has_ansi(out, "1")
+        assert "Deep Section" in _strip_ansi(out)
+        assert "#" not in _strip_ansi(out)
+
+    def test_h6(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("###### Deepest")
+        assert "Deepest" in _strip_ansi(out)
+        assert "#" not in _strip_ansi(out)
+
 
 class TestBlockquote:
     def test_blockquote(self):
@@ -175,6 +188,43 @@ class TestHorizontalRule:
         # Could be hr or bold-italic marker; with nothing between, hr wins
         # because the full-line regex matches first
         assert "─" in _strip_ansi(out)
+
+
+class TestRobustness:
+    """Edge cases that caused corruption in adversarial markdown."""
+
+    def test_unmatched_bold_passthrough(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("some **unmatched bold")
+        assert "**unmatched" in _strip_ansi(out)
+
+    def test_unmatched_italic_passthrough(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("some *unmatched italic")
+        assert "*unmatched" in _strip_ansi(out)
+
+    def test_triple_backticks_mid_text_not_fence(self):
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("Use ```python to start code")
+        plain = _strip_ansi(out)
+        assert "```python" in plain
+        assert "┌" not in plain  # NOT a fence header
+
+    def test_inline_code_protected_from_bold(self):
+        """Bold markers inside inline code should not be interpreted."""
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("Run `**not bold**` here")
+        plain = _strip_ansi(out)
+        assert "**not bold**" in plain
+
+    def test_mixed_unmatched_markers(self):
+        """Multiple unmatched markers shouldn't cascade."""
+        p = MarkdownStreamProcessor()
+        out = p.feed_line("text ** more _ stuff ~~ end")
+        plain = _strip_ansi(out)
+        assert "**" in plain
+        assert "_" in plain
+        assert "~~" in plain
 
 
 class TestEscapedCharacters:
