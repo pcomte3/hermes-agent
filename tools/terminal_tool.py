@@ -611,9 +611,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_env = cc.get("docker_env", {})
 
     if env_type == "local":
-        lc = local_config or {}
-        return _LocalEnvironment(cwd=cwd, timeout=timeout,
-                                 persistent=lc.get("persistent", False))
+        return _LocalEnvironment(cwd=cwd, timeout=timeout)
     
     elif env_type == "docker":
         return _DockerEnvironment(
@@ -705,7 +703,6 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             key_path=ssh_config.get("key", ""),
             cwd=cwd,
             timeout=timeout,
-            persistent=ssh_config.get("persistent", False),
         )
 
     else:
@@ -809,6 +806,12 @@ def _stop_cleanup_thread():
             _cleanup_thread.join(timeout=5)
         except (SystemExit, KeyboardInterrupt):
             pass
+
+
+def get_active_env(task_id: str):
+    """Return the active BaseEnvironment for *task_id*, or None."""
+    with _env_lock:
+        return _active_environments.get(task_id)
 
 
 def get_active_environments_info() -> Dict[str, Any]:
@@ -1617,4 +1620,5 @@ registry.register(
     handler=_handle_terminal,
     check_fn=check_terminal_requirements,
     emoji="💻",
+    max_result_size_chars=100_000,
 )
