@@ -9,6 +9,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
+        'getting-started/termux',
         'getting-started/nix-setup',
         'getting-started/updating',
         'getting-started/learning-path',
@@ -107,6 +108,7 @@ const sidebars: SidebarsConfig = {
         'user-guide/messaging/dingtalk',
         'user-guide/messaging/feishu',
         'user-guide/messaging/wecom',
+        'user-guide/messaging/bluebubbles',
         'user-guide/messaging/open-webui',
         'user-guide/messaging/webhooks',
       ],
