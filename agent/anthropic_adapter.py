@@ -74,8 +74,11 @@ def _get_anthropic_max_output(model: str) -> int:
     model IDs (claude-sonnet-4-5-20250929) and variant suffixes (:1m, :fast)
     resolve correctly.  Longest-prefix match wins to avoid e.g. "claude-3-5"
     matching before "claude-3-5-sonnet".
+
+    Normalizes dots to hyphens so that model names like
+    ``anthropic/claude-opus-4.6`` match the ``claude-opus-4-6`` table key.
     """
-    m = model.lower()
+    m = model.lower().replace(".", "-")
     best_key = ""
     best_val = _ANTHROPIC_DEFAULT_OUTPUT_LIMIT
     for key, val in _ANTHROPIC_OUTPUT_LIMITS.items():
@@ -95,6 +98,10 @@ _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
 ]
+# MiniMax's Anthropic-compatible endpoints fail tool-use requests when
+# the fine-grained tool streaming beta is present.  Omit it so tool calls
+# fall back to the provider's default response path.
+_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 
 # Additional beta headers required for OAuth/subscription auth.
 # Matches what Claude Code (and pi-ai / OpenCode) send.
@@ -204,6 +211,19 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
 
 
+def _common_betas_for_base_url(base_url: str | None) -> list[str]:
+    """Return the beta headers that are safe for the configured endpoint.
+
+    MiniMax's Anthropic-compatible endpoints (Bearer-auth) reject requests
+    that include Anthropic's ``fine-grained-tool-streaming`` beta — every
+    tool-use message triggers a connection error.  Strip that beta for
+    Bearer-auth endpoints while keeping all other betas intact.
+    """
+    if _requires_bearer_auth(base_url):
+        return [b for b in _COMMON_BETAS if b != _TOOL_STREAMING_BETA]
+    return _COMMON_BETAS
+
+
 def build_anthropic_client(api_key: str, base_url: str = None):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -222,6 +242,7 @@ def build_anthropic_client(api_key: str, base_url: str = None):
     }
     if normalized_base_url:
         kwargs["base_url"] = normalized_base_url
+    common_betas = _common_betas_for_base_url(normalized_base_url)
 
     if _requires_bearer_auth(normalized_base_url):
         # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
@@ -231,21 +252,21 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
         # Anthropic OAuth/setup tokens.
         kwargs["auth_token"] = api_key
-        if _COMMON_BETAS:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
+        if common_betas:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_third_party_anthropic_endpoint(base_url):
         # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
         # own API keys with x-api-key auth. Skip OAuth detection — their keys
         # don't follow Anthropic's sk-ant-* prefix convention and would be
         # misclassified as OAuth tokens.
         kwargs["api_key"] = api_key
-        if _COMMON_BETAS:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
+        if common_betas:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
-        all_betas = _COMMON_BETAS + _OAUTH_ONLY_BETAS
+        all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
@@ -255,8 +276,8 @@ def build_anthropic_client(api_key: str, base_url: str = None):
     else:
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key
-        if _COMMON_BETAS:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
+        if common_betas:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
     return _anthropic_sdk.Anthropic(**kwargs)
 
@@ -1238,10 +1259,27 @@ def build_anthropic_kwargs(
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
-    When *max_tokens* is None, the model's native output limit is used
-    (e.g. 128K for Opus 4.6, 64K for Sonnet 4.6).  If *context_length*
-    is provided, the effective limit is clamped so it doesn't exceed
-    the context window.
+    Naming note — two distinct concepts, easily confused:
+      max_tokens     = OUTPUT token cap for a single response.
+                       Anthropic's API calls this "max_tokens" but it only
+                       limits the *output*.  Anthropic's own native SDK
+                       renamed it "max_output_tokens" for clarity.
+      context_length = TOTAL context window (input tokens + output tokens).
+                       The API enforces: input_tokens + max_tokens ≤ context_length.
+                       Stored on the ContextCompressor; reduced on overflow errors.
+
+    When *max_tokens* is None the model's native output ceiling is used
+    (e.g. 128K for Opus 4.6, 64K for Sonnet 4.6).
+
+    When *context_length* is provided and the model's native output ceiling
+    exceeds it (e.g. a local endpoint with an 8K window), the output cap is
+    clamped to context_length − 1.  This only kicks in for unusually small
+    context windows; for full-size models the native output cap is always
+    smaller than the context window so no clamping happens.
+    NOTE: this clamping does not account for prompt size — if the prompt is
+    large, Anthropic may still reject the request.  The caller must detect
+    "max_tokens too large given prompt" errors and retry with a smaller cap
+    (see parse_available_output_tokens_from_error + _ephemeral_max_output_tokens).
 
     When *is_oauth* is True, applies Claude Code compatibility transforms:
     system prompt prefix, tool name prefixing, and prompt sanitization.
@@ -1256,10 +1294,14 @@ def build_anthropic_kwargs(
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
 
     model = normalize_model_name(model, preserve_dots=preserve_dots)
+    # effective_max_tokens = output cap for this call (≠ total context window)
     effective_max_tokens = max_tokens or _get_anthropic_max_output(model)
 
-    # Clamp to context window if the user set a lower context_length
-    # (e.g. custom endpoint with limited capacity).
+    # Clamp output cap to fit inside the total context window.
+    # Only matters for small custom endpoints where context_length < native
+    # output ceiling.  For standard Anthropic models context_length (e.g.
+    # 200K) is always larger than the output ceiling (e.g. 128K), so this
+    # branch is not taken.
     if context_length and effective_max_tokens > context_length:
         effective_max_tokens = max(context_length - 1, 1)
 

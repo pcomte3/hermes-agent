@@ -646,6 +646,7 @@ def cmd_chat(args):
         "verbose": args.verbose,
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
+        "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
         "checkpoints": getattr(args, "checkpoints", False),
@@ -1474,7 +1475,11 @@ def _model_flow_custom(config):
             f"Hermes will still save it."
         )
         if probe.get("suggested_base_url"):
-            print(f"  If this server expects /v1, try base URL: {probe['suggested_base_url']}")
+            suggested = probe["suggested_base_url"]
+            if suggested.endswith("/v1"):
+                print(f"  If this server expects /v1 in the path, try base URL: {suggested}")
+            else:
+                print(f"  If /v1 should not be in the base URL, try: {suggested}")
 
     # Select model — use probe results when available, fall back to manual input
     model_name = ""
@@ -1807,7 +1812,10 @@ def _set_reasoning_effort(config, effort: str) -> None:
 
 def _prompt_reasoning_effort_selection(efforts, current_effort=""):
     """Prompt for a reasoning effort. Returns effort, 'none', or None to keep current."""
-    ordered = list(dict.fromkeys(str(effort).strip().lower() for effort in efforts if str(effort).strip()))
+    deduped = list(dict.fromkeys(str(effort).strip().lower() for effort in efforts if str(effort).strip()))
+    canonical_order = ("minimal", "low", "medium", "high", "xhigh")
+    ordered = [effort for effort in canonical_order if effort in deduped]
+    ordered.extend(effort for effort in deduped if effort not in canonical_order)
     if not ordered:
         return None
 
@@ -2637,6 +2645,12 @@ def cmd_doctor(args):
     """Check configuration and dependencies."""
     from hermes_cli.doctor import run_doctor
     run_doctor(args)
+
+
+def cmd_dump(args):
+    """Dump setup summary for support/debugging."""
+    from hermes_cli.dump import run_dump
+    run_dump(args)
 
 
 def cmd_config(args):
@@ -3750,7 +3764,7 @@ def cmd_update(args):
         # running gateway needs restarting to pick up the new code.
         try:
             from hermes_cli.gateway import (
-                is_macos, is_linux, _ensure_user_systemd_env,
+                is_macos, supports_systemd_services, _ensure_user_systemd_env,
                 find_gateway_pids,
                 _get_service_pids,
             )
@@ -3761,7 +3775,7 @@ def cmd_update(args):
 
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles)
-            if is_linux():
+            if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
                 except Exception:
@@ -4279,6 +4293,10 @@ For more help on a command:
         help="Single query (non-interactive mode)"
     )
     chat_parser.add_argument(
+        "--image",
+        help="Optional local image path to attach to a single query"
+    )
+    chat_parser.add_argument(
         "-m", "--model",
         help="Model to use (e.g., anthropic/claude-sonnet-4)"
     )
@@ -4720,6 +4738,22 @@ For more help on a command:
         help="Attempt to fix issues automatically"
     )
     doctor_parser.set_defaults(func=cmd_doctor)
+
+    # =========================================================================
+    # dump command
+    # =========================================================================
+    dump_parser = subparsers.add_parser(
+        "dump",
+        help="Dump setup summary for support/debugging",
+        description="Output a compact, plain-text summary of your Hermes setup "
+                    "that can be copy-pasted into Discord/GitHub for support context"
+    )
+    dump_parser.add_argument(
+        "--show-keys",
+        action="store_true",
+        help="Show redacted API key prefixes (first/last 4 chars) instead of just set/not set"
+    )
+    dump_parser.set_defaults(func=cmd_dump)
     
     # =========================================================================
     # config command

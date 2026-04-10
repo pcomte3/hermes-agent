@@ -121,6 +121,9 @@ class TelegramAdapter(BasePlatformAdapter):
     
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
+    # Threshold for detecting Telegram client-side message splits.
+    # When a chunk is near this limit, a continuation is almost certain.
+    _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     
     def __init__(self, config: PlatformConfig):
@@ -140,6 +143,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Buffer rapid text messages so Telegram client-side splits of long
         # messages are aggregated into a single MessageEvent.
         self._text_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
+        self._text_batch_split_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._token_lock_identity: Optional[str] = None
@@ -1398,6 +1402,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="Invalid approval data.")
                     return
 
+                # Only authorized users may click approval buttons.
+                caller_id = str(getattr(query.from_user, "id", ""))
+                allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+                if allowed_csv:
+                    allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+                    if "*" not in allowed_ids and caller_id not in allowed_ids:
+                        await query.answer(text="⛔ You are not authorized to approve commands.")
+                        return
+
                 session_key = self._approval_state.pop(approval_id, None)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
@@ -2151,12 +2164,15 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
+        chunk_len = len(event.text or "")
         if existing is None:
+            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             # Merge any media that might be attached
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -2171,10 +2187,22 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     async def _flush_text_batch(self, key: str) -> None:
-        """Wait for the quiet period then dispatch the aggregated text."""
+        """Wait for the quiet period then dispatch the aggregated text.
+
+        Uses a longer delay when the latest chunk is near Telegram's 4096-char
+        split point, since a continuation chunk is almost certain.
+        """
         current_task = asyncio.current_task()
         try:
-            await asyncio.sleep(self._text_batch_delay_seconds)
+            # Adaptive delay: if the latest chunk is near Telegram's 4096-char
+            # split point, a continuation is almost certain — wait longer.
+            pending = self._pending_text_batches.get(key)
+            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+            if last_len >= self._SPLIT_THRESHOLD:
+                delay = self._text_batch_split_delay_seconds
+            else:
+                delay = self._text_batch_delay_seconds
+            await asyncio.sleep(delay)
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return

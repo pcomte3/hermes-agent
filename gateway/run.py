@@ -925,8 +925,8 @@ class GatewayRunner:
     def _load_reasoning_config() -> dict | None:
         """Load reasoning effort from config.yaml.
 
-        Reads agent.reasoning_effort from config.yaml. Valid: "xhigh",
-        "high", "medium", "low", "minimal", "none". Returns None to use
+        Reads agent.reasoning_effort from config.yaml. Valid: "none",
+        "minimal", "low", "medium", "high", "xhigh". Returns None to use
         default (medium).
         """
         from hermes_constants import parse_reasoning_effort
@@ -1075,6 +1075,7 @@ class GatewayRunner:
                        "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
                        "FEISHU_ALLOWED_USERS",
                        "WECOM_ALLOWED_USERS",
+                       "BLUEBUBBLES_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
@@ -1085,7 +1086,8 @@ class GatewayRunner:
                        "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
                        "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
                        "FEISHU_ALLOW_ALL_USERS",
-                       "WECOM_ALLOW_ALL_USERS")
+                       "WECOM_ALLOW_ALL_USERS",
+                       "BLUEBUBBLES_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
@@ -1656,6 +1658,13 @@ class GatewayRunner:
             adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
 
+        elif platform == Platform.BLUEBUBBLES:
+            from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
+            if not check_bluebubbles_requirements():
+                logger.warning("BlueBubbles: aiohttp/httpx missing or BLUEBUBBLES_SERVER_URL/BLUEBUBBLES_PASSWORD not configured")
+                return None
+            return BlueBubblesAdapter(config)
+
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -1694,6 +1703,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -1708,6 +1718,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -1781,8 +1792,11 @@ class GatewayRunner:
         """
         source = event.source
 
-        # Check if user is authorized
-        if not self._is_user_authorized(source):
+        # Internal events (e.g. background-process completion notifications)
+        # are system-generated and must skip user authorization.
+        if getattr(event, "internal", False):
+            pass
+        elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
@@ -4826,7 +4840,7 @@ class GatewayRunner:
 
         Usage:
             /reasoning              Show current effort level and display state
-            /reasoning <level>      Set reasoning effort (none, low, medium, high, xhigh)
+            /reasoning <level>      Set reasoning effort (none, minimal, low, medium, high, xhigh)
             /reasoning show|on      Show model reasoning in responses
             /reasoning hide|off     Hide model reasoning from responses
         """
@@ -4871,7 +4885,7 @@ class GatewayRunner:
                 "🧠 **Reasoning Settings**\n\n"
                 f"**Effort:** `{level}`\n"
                 f"**Display:** {display_state}\n\n"
-                "_Usage:_ `/reasoning <none|low|medium|high|xhigh|show|hide>`"
+                "_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|show|hide>`"
             )
 
         # Display toggle
@@ -4889,12 +4903,12 @@ class GatewayRunner:
         effort = args.strip()
         if effort == "none":
             parsed = {"enabled": False}
-        elif effort in ("xhigh", "high", "medium", "low", "minimal"):
+        elif effort in ("minimal", "low", "medium", "high", "xhigh"):
             parsed = {"enabled": True, "effort": effort}
         else:
             return (
                 f"⚠️ Unknown argument: `{effort}`\n\n"
-                "**Valid levels:** none, low, minimal, medium, high, xhigh\n"
+                "**Valid levels:** none, minimal, low, medium, high, xhigh\n"
                 "**Display:** show, hide"
             )
 
@@ -5266,19 +5280,28 @@ class GatewayRunner:
 
         agent = self._running_agents.get(session_key)
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
-            lines = [
-                "📊 **Session Token Usage**",
-                f"Prompt (input): {agent.session_prompt_tokens:,}",
-                f"Completion (output): {agent.session_completion_tokens:,}",
-                f"Total: {agent.session_total_tokens:,}",
-                f"API calls: {agent.session_api_calls}",
-            ]
+            lines = []
+
+            # Rate limits first (when available from provider headers)
+            rl_state = agent.get_rate_limit_state()
+            if rl_state and rl_state.has_data:
+                from agent.rate_limit_tracker import format_rate_limit_compact
+                lines.append(f"⏱️ **Rate Limits:** {format_rate_limit_compact(rl_state)}")
+                lines.append("")
+
+            # Session token usage
+            lines.append("📊 **Session Token Usage**")
+            lines.append(f"Prompt (input): {agent.session_prompt_tokens:,}")
+            lines.append(f"Completion (output): {agent.session_completion_tokens:,}")
+            lines.append(f"Total: {agent.session_total_tokens:,}")
+            lines.append(f"API calls: {agent.session_api_calls}")
             ctx = agent.context_compressor
             if ctx.last_prompt_tokens:
                 pct = min(100, ctx.last_prompt_tokens / ctx.context_length * 100) if ctx.context_length else 0
                 lines.append(f"Context: {ctx.last_prompt_tokens:,} / {ctx.context_length:,} ({pct:.0f}%)")
             if ctx.compression_count:
                 lines.append(f"Compressions: {ctx.compression_count}")
+
             return "\n".join(lines)
 
         # No running agent -- check session history for a rough count
@@ -5520,7 +5543,7 @@ class GatewayRunner:
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
-        Platform.FEISHU, Platform.WECOM, Platform.LOCAL,
+        Platform.FEISHU, Platform.WECOM, Platform.BLUEBUBBLES, Platform.LOCAL,
     })
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
@@ -6160,6 +6183,7 @@ class GatewayRunner:
                                 text=synth_text,
                                 message_type=MessageType.TEXT,
                                 source=_source,
+                                internal=True,
                             )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s",
@@ -6420,6 +6444,18 @@ class GatewayRunner:
 
             adapter = self.adapters.get(source.platform)
             if not adapter:
+                return
+
+            # Skip tool progress for platforms that don't support message
+            # editing (e.g. iMessage/BlueBubbles) — each progress update
+            # would become a separate message bubble, which is noisy.
+            from gateway.platforms.base import BasePlatformAdapter as _BaseAdapter
+            if type(adapter).edit_message is _BaseAdapter.edit_message:
+                while not progress_queue.empty():
+                    try:
+                        progress_queue.get_nowait()
+                    except Exception:
+                        break
                 return
 
             progress_lines = []      # Accumulated tool lines

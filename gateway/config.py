@@ -63,6 +63,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    BLUEBUBBLES = "bluebubbles"
 
 
 @dataclass
@@ -286,6 +287,9 @@ class GatewayConfig:
                 connected.append(platform)
             # WeCom uses extra dict for bot credentials
             elif platform == Platform.WECOM and config.extra.get("bot_id"):
+                connected.append(platform)
+            # BlueBubbles uses extra dict for local server config
+            elif platform == Platform.BLUEBUBBLES and config.extra.get("server_url") and config.extra.get("password"):
                 connected.append(platform)
         return connected
     
@@ -528,6 +532,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
+                if "free_response_channels" in platform_cfg:
+                    bridged["free_response_channels"] = platform_cfg["free_response_channels"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if not bridged:
@@ -541,6 +547,19 @@ def load_gateway_config() -> GatewayConfig:
                     extra = {}
                     plat_data["extra"] = extra
                 extra.update(bridged)
+
+            # Slack settings → env vars (env vars take precedence)
+            slack_cfg = yaml_cfg.get("slack", {})
+            if isinstance(slack_cfg, dict):
+                if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
+                    os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
+                if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
+                    os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+                frc = slack_cfg.get("free_response_channels")
+                if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
+                    if isinstance(frc, list):
+                        frc = ",".join(str(v) for v in frc)
+                    os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
 
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
@@ -882,6 +901,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+        api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
+        if api_server_model_name:
+            config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")
@@ -947,6 +969,29 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
             )
+
+    # BlueBubbles (iMessage)
+    bluebubbles_server_url = os.getenv("BLUEBUBBLES_SERVER_URL")
+    bluebubbles_password = os.getenv("BLUEBUBBLES_PASSWORD")
+    if bluebubbles_server_url and bluebubbles_password:
+        if Platform.BLUEBUBBLES not in config.platforms:
+            config.platforms[Platform.BLUEBUBBLES] = PlatformConfig()
+        config.platforms[Platform.BLUEBUBBLES].enabled = True
+        config.platforms[Platform.BLUEBUBBLES].extra.update({
+            "server_url": bluebubbles_server_url.rstrip("/"),
+            "password": bluebubbles_password,
+            "webhook_host": os.getenv("BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1"),
+            "webhook_port": int(os.getenv("BLUEBUBBLES_WEBHOOK_PORT", "8645")),
+            "webhook_path": os.getenv("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
+            "send_read_receipts": os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in ("true", "1", "yes"),
+        })
+    bluebubbles_home = os.getenv("BLUEBUBBLES_HOME_CHANNEL")
+    if bluebubbles_home and Platform.BLUEBUBBLES in config.platforms:
+        config.platforms[Platform.BLUEBUBBLES].home_channel = HomeChannel(
+            platform=Platform.BLUEBUBBLES,
+            chat_id=bluebubbles_home,
+            name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
+        )
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

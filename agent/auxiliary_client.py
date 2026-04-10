@@ -629,11 +629,19 @@ def _nous_base_url() -> str:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store."""
+    """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
+
+    If a credential pool exists but currently has no selectable runtime entry
+    (for example all pool slots are marked exhausted), fall back to the
+    profile's auth.json token instead of hard-failing. This keeps explicit
+    fallback-to-Codex working when the pool state is stale but the stored OAuth
+    token is still valid.
+    """
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)
-        return token or None
+        if token:
+            return token
 
     try:
         from hermes_cli.auth import _read_codex_tokens
@@ -694,7 +702,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             logger.debug("Auxiliary text client: %s (%s) via pool", pconfig.name, model)
             extra = {}
             if "api.kimi.com" in base_url.lower():
-                extra["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+                extra["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
             elif "api.githubcopilot.com" in base_url.lower():
                 from hermes_cli.models import copilot_default_headers
 
@@ -713,7 +721,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
         extra = {}
         if "api.kimi.com" in base_url.lower():
-            extra["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+            extra["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
         elif "api.githubcopilot.com" in base_url.lower():
             from hermes_cli.models import copilot_default_headers
 
@@ -894,9 +902,13 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         codex_token = _pool_runtime_api_key(entry)
-        if not codex_token:
-            return None, None
-        base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+        if codex_token:
+            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+        else:
+            codex_token = _read_codex_access_token()
+            if not codex_token:
+                return None, None
+            base_url = _CODEX_AUX_BASE_URL
     else:
         codex_token = _read_codex_access_token()
         if not codex_token:
@@ -1035,6 +1047,32 @@ def _is_payment_error(exc: Exception) -> bool:
     return False
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """Detect connection/network errors that warrant provider fallback.
+
+    Returns True for errors indicating the provider endpoint is unreachable
+    (DNS failure, connection refused, TLS errors, timeouts).  These are
+    distinct from API errors (4xx/5xx) which indicate the provider IS
+    reachable but returned an error.
+    """
+    from openai import APIConnectionError, APITimeoutError
+
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    # urllib3 / httpx / httpcore connection errors
+    err_type = type(exc).__name__
+    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
+        return True
+    err_lower = str(exc).lower()
+    if any(kw in err_lower for kw in (
+        "connection refused", "name or service not known",
+        "no route to host", "network is unreachable",
+        "timed out", "connection reset",
+    )):
+        return True
+    return False
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -1099,7 +1137,7 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     main_model = _read_main_model()
     if (main_provider and main_model
             and main_provider not in _AGGREGATOR_PROVIDERS
-            and main_provider not in ("auto", "custom", "")):
+            and main_provider not in ("auto", "")):
         client, resolved = resolve_provider_client(main_provider, main_model)
         if client is not None:
             logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -1157,7 +1195,7 @@ def _to_async_client(sync_client, model: str):
 
         async_kwargs["default_headers"] = copilot_default_headers()
     elif "api.kimi.com" in base_lower:
-        async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+        async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -1277,7 +1315,13 @@ def resolve_provider_client(
                 )
                 return None, None
             final_model = model or _read_main_model() or "gpt-4o-mini"
-            client = OpenAI(api_key=custom_key, base_url=custom_base)
+            extra = {}
+            if "api.kimi.com" in custom_base.lower():
+                extra["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
+            elif "api.githubcopilot.com" in custom_base.lower():
+                from hermes_cli.models import copilot_default_headers
+                extra["default_headers"] = copilot_default_headers()
+            client = OpenAI(api_key=custom_key, base_url=custom_base, **extra)
             return (_to_async_client(client, final_model) if async_mode
                     else (client, final_model))
         # Try custom first, then codex, then API-key providers
@@ -1356,7 +1400,7 @@ def resolve_provider_client(
         # Provider-specific headers
         headers = {}
         if "api.kimi.com" in base_url.lower():
-            headers["User-Agent"] = "KimiCLI/1.0"
+            headers["User-Agent"] = "KimiCLI/1.3"
         elif "api.githubcopilot.com" in base_url.lower():
             from hermes_cli.models import copilot_default_headers
 
@@ -2081,7 +2125,18 @@ def call_llm(
         # try alternative providers instead of giving up.  This handles the
         # common case where a user runs out of OpenRouter credits but has
         # Codex OAuth or another provider available.
-        if _is_payment_error(first_err):
+        #
+        # ── Connection error fallback ────────────────────────────────
+        # When a provider endpoint is unreachable (DNS failure, connection
+        # refused, timeout), try alternative providers.  This handles stale
+        # Codex/OAuth tokens that authenticate but whose endpoint is down,
+        # and providers the user never configured that got picked up by
+        # the auto-detection chain.
+        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+        if should_fallback:
+            reason = "payment error" if _is_payment_error(first_err) else "connection error"
+            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+                        task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task)
             if fb_client is not None:

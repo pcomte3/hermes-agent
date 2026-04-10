@@ -1017,6 +1017,47 @@ def provider_label(provider: Optional[str]) -> str:
     return _PROVIDER_LABELS.get(normalized, original or "OpenRouter")
 
 
+# Models that support OpenAI Priority Processing (service_tier="priority").
+# See https://openai.com/api-priority-processing/ for the canonical list.
+# Only the bare model slug is stored (no vendor prefix).
+_PRIORITY_PROCESSING_MODELS: frozenset[str] = frozenset({
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "o3",
+    "o4-mini",
+})
+
+
+def model_supports_fast_mode(model_id: Optional[str]) -> bool:
+    """Return whether Hermes should expose the /fast (Priority Processing) toggle."""
+    raw = str(model_id or "").strip().lower()
+    if "/" in raw:
+        raw = raw.split("/", 1)[1]
+    return raw in _PRIORITY_PROCESSING_MODELS
+
+
+def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | None:
+    """Return request_overrides for Priority Processing, or None if unsupported.
+
+    Unlike the previous ``resolve_fast_mode_runtime``, this does NOT force a
+    provider/backend switch.  The ``service_tier`` parameter is injected into
+    whatever API path the user is already on (Codex Responses, Chat Completions,
+    or OpenRouter passthrough).
+    """
+    if not model_supports_fast_mode(model_id):
+        return None
+    return {"service_tier": "priority"}
+
+
 def _resolve_copilot_catalog_api_key() -> str:
     """Best-effort GitHub token for fetching the Copilot model catalog."""
     try:
@@ -1532,7 +1573,7 @@ def probe_api_models(
 
     return {
         "models": None,
-        "probed_url": tried[-1] if tried else normalized.rstrip("/") + "/models",
+        "probed_url": tried[0] if tried else normalized.rstrip("/") + "/models",
         "resolved_base_url": normalized,
         "suggested_base_url": alternate_base if alternate_base != normalized else None,
         "used_fallback": False,
