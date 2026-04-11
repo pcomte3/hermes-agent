@@ -973,7 +973,8 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         return await original_connect(*args, **kwargs)
 
     def _configure_with_overrides(conf: Any) -> Any:
-        assert original_configure is not None
+        if original_configure is None:
+            raise RuntimeError("Feishu _configure_with_overrides called but original_configure is None")
         result = original_configure(conf)
         _apply_runtime_ws_overrides()
         return result
@@ -1189,6 +1190,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
             )
             .register_p2_card_action_trigger(self._on_card_action_trigger)
+            .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
+            .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
             .build()
         )
 
@@ -1579,13 +1582,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Image file not found: {image_path}")
 
         try:
-            with open(image_path, "rb") as image_file:
-                body = self._build_image_upload_body(
-                    image_type=_FEISHU_IMAGE_UPLOAD_TYPE,
-                    image=image_file,
-                )
-                request = self._build_image_upload_request(body)
-                upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
+            import io as _io
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+            # Wrap in BytesIO so lark SDK's MultipartEncoder can read .name and .tell()
+            image_file = _io.BytesIO(image_bytes)
+            image_file.name = os.path.basename(image_path)
+            body = self._build_image_upload_body(
+                image_type=_FEISHU_IMAGE_UPLOAD_TYPE,
+                image=image_file,
+            )
+            request = self._build_image_upload_request(body)
+            upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
                 return self._response_error_result(

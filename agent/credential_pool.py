@@ -739,17 +739,6 @@ class CredentialPool:
             return False
         return False
 
-    def mark_used(self, entry_id: Optional[str] = None) -> None:
-        """Increment request_count for tracking. Used by least_used strategy."""
-        target_id = entry_id or self._current_id
-        if not target_id:
-            return
-        with self._lock:
-            for idx, entry in enumerate(self._entries):
-                if entry.id == target_id:
-                    self._entries[idx] = replace(entry, request_count=entry.request_count + 1)
-                    return
-
     def select(self) -> Optional[PooledCredential]:
         with self._lock:
             return self._select_unlocked()
@@ -911,11 +900,6 @@ class CredentialPool:
             else:
                 self._active_leases[credential_id] = count - 1
 
-    def active_lease_count(self, credential_id: str) -> int:
-        """Return the number of active leases for a credential."""
-        with self._lock:
-            return self._active_leases.get(credential_id, 0)
-
     def try_refresh_current(self) -> Optional[PooledCredential]:
         with self._lock:
             return self._try_refresh_current_unlocked()
@@ -1075,6 +1059,17 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
     auth_store = _load_auth_store()
 
     if provider == "anthropic":
+        # Only auto-discover external credentials (Claude Code, Hermes PKCE)
+        # when the user has explicitly configured anthropic as their provider.
+        # Without this gate, auxiliary client fallback chains silently read
+        # ~/.claude/.credentials.json without user consent.  See PR #4210.
+        try:
+            from hermes_cli.auth import is_provider_explicitly_configured
+            if not is_provider_explicitly_configured("anthropic"):
+                return changed, active_sources
+        except ImportError:
+            pass
+
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
         for source_name, creds in (
@@ -1082,6 +1077,13 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             ("claude_code", read_claude_code_credentials()),
         ):
             if creds and creds.get("accessToken"):
+                # Check if user explicitly removed this source
+                try:
+                    from hermes_cli.auth import is_source_suppressed
+                    if is_source_suppressed(provider, source_name):
+                        continue
+                except ImportError:
+                    pass
                 active_sources.add(source_name)
                 changed |= _upsert_entry(
                     entries,
