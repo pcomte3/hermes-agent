@@ -85,6 +85,9 @@ compression:
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
   summary_model: null        # Override model for summaries (default: uses auxiliary)
+  flush_strategy: llm        # "llm" or "offline" — memory extraction method
+  summary_strategy: llm      # "llm" or "offline" — context summarization method
+  offline_rate: 0.3          # token retention for offline compression (0.0-1.0)
 ```
 
 ### Parameter Details
@@ -95,6 +98,19 @@ compression:
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
+| `flush_strategy` | `llm` | `llm`, `offline` | How memories are extracted before compression (see below) |
+| `summary_strategy` | `llm` | `llm`, `offline` | How the context summary is generated (see below) |
+| `offline_rate` | `0.3` | 0.0-1.0 | Token retention rate for offline compression (0.3 = keep 30%) |
+
+### Offline Compression Strategy
+
+When set to `offline`, compression operates without any LLM calls using encoder-only classification models:
+
+- **`flush_strategy: offline`** — Replaces the LLM-based `flush_memories` call with [GLiNER2](https://arxiv.org/abs/2507.18546) (205M params), a schema-driven zero-shot span classifier. It extracts user preferences, facts, decisions, and corrections from conversation turns and writes them to MEMORY.md/USER.md via the built-in memory tool. Language-agnostic (100+ languages).
+
+- **`summary_strategy: offline`** — Replaces the LLM-based summary generation with [LLMLingua-2](https://arxiv.org/abs/2403.12968) (XLM-RoBERTa, 355M params), a token-level keep/discard classifier trained on MeetingBank conversation data. Achieves 95-98% information retention at 2-5x compression. The output is extractive (preserves original words) rather than abstractive. Language-agnostic (100+ languages).
+
+Both strategies fall through to the LLM path on failure. Install dependencies with: `pip install gliner2 llmlingua`
 
 ### Computed Values (for a 200K context model at defaults)
 

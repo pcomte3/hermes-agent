@@ -1231,6 +1231,8 @@ class AIAgent:
         compression_summary_model = _compression_cfg.get("summary_model") or None
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        self._flush_strategy = str(_compression_cfg.get("flush_strategy", "llm")).strip().lower()
+        _summary_strategy = str(_compression_cfg.get("summary_strategy", "llm")).strip().lower()
 
         # Read explicit context_length override from model config
         _model_cfg = _agent_cfg.get("model", {})
@@ -1324,6 +1326,8 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
             )
+            self.context_compressor.summary_strategy = _summary_strategy
+            self.context_compressor.offline_rate = float(_compression_cfg.get("offline_rate", 0.3))
         self.compression_enabled = compression_enabled
 
         # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
@@ -6274,69 +6278,79 @@ class AIAgent:
                 messages.pop()  # remove flush msg
                 return
 
-            # Use auxiliary client for the flush call when available --
-            # it's cheaper and avoids Codex Responses API incompatibility.
-            from agent.auxiliary_client import call_llm as _call_llm
-            _aux_available = True
-            try:
-                response = _call_llm(
-                    task="flush_memories",
-                    messages=api_messages,
-                    tools=[memory_tool_def],
-                    temperature=0.3,
-                    max_tokens=5120,
-                    # timeout resolved from auxiliary.flush_memories.timeout config
-                )
-            except RuntimeError:
-                _aux_available = False
-                response = None
-
-            if not _aux_available and self.api_mode == "codex_responses":
-                # No auxiliary client -- use the Codex Responses path directly
-                codex_kwargs = self._build_api_kwargs(api_messages)
-                codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
-                codex_kwargs["temperature"] = 0.3
-                if "max_output_tokens" in codex_kwargs:
-                    codex_kwargs["max_output_tokens"] = 5120
-                response = self._run_codex_stream(codex_kwargs)
-            elif not _aux_available and self.api_mode == "anthropic_messages":
-                # Native Anthropic — use the Anthropic client directly
-                from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
-                ant_kwargs = _build_ant_kwargs(
-                    model=self.model, messages=api_messages,
-                    tools=[memory_tool_def], max_tokens=5120,
-                    reasoning_config=None,
-                    preserve_dots=self._anthropic_preserve_dots(),
-                )
-                response = self._anthropic_messages_create(ant_kwargs)
-            elif not _aux_available:
-                api_kwargs = {
-                    "model": self.model,
-                    "messages": api_messages,
-                    "tools": [memory_tool_def],
-                    "temperature": 0.3,
-                    **self._max_tokens_param(5120),
-                }
-                from agent.auxiliary_client import _get_task_timeout
-                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(
-                    **api_kwargs, timeout=_get_task_timeout("flush_memories")
-                )
-
-            # Extract tool calls from the response, handling all API formats
             tool_calls = []
-            if self.api_mode == "codex_responses" and not _aux_available:
-                assistant_msg, _ = self._normalize_codex_response(response)
-                if assistant_msg and assistant_msg.tool_calls:
-                    tool_calls = assistant_msg.tool_calls
-            elif self.api_mode == "anthropic_messages" and not _aux_available:
-                from agent.anthropic_adapter import normalize_anthropic_response as _nar_flush
-                _flush_msg, _ = _nar_flush(response, strip_tool_prefix=self._is_anthropic_oauth)
-                if _flush_msg and _flush_msg.tool_calls:
-                    tool_calls = _flush_msg.tool_calls
-            elif hasattr(response, "choices") and response.choices:
-                assistant_message = response.choices[0].message
-                if assistant_message.tool_calls:
-                    tool_calls = assistant_message.tool_calls
+
+            if self._flush_strategy == "offline":
+                # Offline memory extraction — no LLM call required.
+                # Uses GLiNER2 encoder-only span classification.
+                from agent.offline_extractor import extract_memories
+                tool_calls = extract_memories(messages)
+            else:
+                # LLM-based flush (default) — send full conversation to
+                # auxiliary model and let it decide what to persist.
+
+                # Use auxiliary client for the flush call when available --
+                # it's cheaper and avoids Codex Responses API incompatibility.
+                from agent.auxiliary_client import call_llm as _call_llm
+                _aux_available = True
+                try:
+                    response = _call_llm(
+                        task="flush_memories",
+                        messages=api_messages,
+                        tools=[memory_tool_def],
+                        temperature=0.3,
+                        max_tokens=5120,
+                        # timeout resolved from auxiliary.flush_memories.timeout config
+                    )
+                except RuntimeError:
+                    _aux_available = False
+                    response = None
+
+                if not _aux_available and self.api_mode == "codex_responses":
+                    # No auxiliary client -- use the Codex Responses path directly
+                    codex_kwargs = self._build_api_kwargs(api_messages)
+                    codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
+                    codex_kwargs["temperature"] = 0.3
+                    if "max_output_tokens" in codex_kwargs:
+                        codex_kwargs["max_output_tokens"] = 5120
+                    response = self._run_codex_stream(codex_kwargs)
+                elif not _aux_available and self.api_mode == "anthropic_messages":
+                    # Native Anthropic — use the Anthropic client directly
+                    from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
+                    ant_kwargs = _build_ant_kwargs(
+                        model=self.model, messages=api_messages,
+                        tools=[memory_tool_def], max_tokens=5120,
+                        reasoning_config=None,
+                        preserve_dots=self._anthropic_preserve_dots(),
+                    )
+                    response = self._anthropic_messages_create(ant_kwargs)
+                elif not _aux_available:
+                    api_kwargs = {
+                        "model": self.model,
+                        "messages": api_messages,
+                        "tools": [memory_tool_def],
+                        "temperature": 0.3,
+                        **self._max_tokens_param(5120),
+                    }
+                    from agent.auxiliary_client import _get_task_timeout
+                    response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(
+                        **api_kwargs, timeout=_get_task_timeout("flush_memories")
+                    )
+
+                # Extract tool calls from the response, handling all API formats
+                if self.api_mode == "codex_responses" and not _aux_available:
+                    assistant_msg, _ = self._normalize_codex_response(response)
+                    if assistant_msg and assistant_msg.tool_calls:
+                        tool_calls = assistant_msg.tool_calls
+                elif self.api_mode == "anthropic_messages" and not _aux_available:
+                    from agent.anthropic_adapter import normalize_anthropic_response as _nar_flush
+                    _flush_msg, _ = _nar_flush(response, strip_tool_prefix=self._is_anthropic_oauth)
+                    if _flush_msg and _flush_msg.tool_calls:
+                        tool_calls = _flush_msg.tool_calls
+                elif hasattr(response, "choices") and response.choices:
+                    assistant_message = response.choices[0].message
+                    if assistant_message.tool_calls:
+                        tool_calls = assistant_message.tool_calls
 
             for tc in tool_calls:
                 if tc.function.name == "memory":

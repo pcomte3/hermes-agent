@@ -126,3 +126,12 @@ markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
 ]
 addopts = "-m 'not integration' -n auto"
+filterwarnings = [
+    # sentencepiece 0.2.1 SWIG bindings lack __module__ — upstream C extension issue
+    "ignore:builtin type Swig.*has no __module__:DeprecationWarning",
+    "ignore:builtin type swigvarlink.*has no __module__:DeprecationWarning",
+    # gliner 0.2.26 uses torch.jit.script internally — deprecated in torch 2.11+
+    "ignore:`torch.jit.script` is deprecated:DeprecationWarning",
+    # gliner 0.2.26 passes resume_download= to huggingface_hub — deprecated in hf_hub 1.9+
+    "ignore:.*resume_download.*is deprecated:UserWarning",
+]

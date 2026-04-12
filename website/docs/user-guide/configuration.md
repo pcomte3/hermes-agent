@@ -444,6 +444,9 @@ compression:
   summary_model: "google/gemini-3-flash-preview"    # Model for summarization
   summary_provider: "auto"                          # Provider: "auto", "openrouter", "nous", "codex", "main", etc.
   summary_base_url: null                            # Custom OpenAI-compatible endpoint (overrides provider)
+  flush_strategy: llm                               # "llm" or "offline" — memory extraction method
+  summary_strategy: llm                             # "llm" or "offline" — context summarization method
+  offline_rate: 0.3                                 # token retention rate for offline compression (0.0-1.0)
 ```
 
 ### Common setups
@@ -471,6 +474,22 @@ compression:
   summary_base_url: https://api.z.ai/api/coding/paas/v4
 ```
 Points at a custom OpenAI-compatible endpoint. Uses `OPENAI_API_KEY` for auth.
+
+**Offline mode** (no LLM calls, full data sovereignty):
+```yaml
+compression:
+  flush_strategy: offline
+  summary_strategy: offline
+```
+Uses encoder-only models for language-agnostic compression without any LLM dependency:
+- **Memory extraction** (`flush_strategy: offline`): GLiNER2 (205M params) performs schema-driven zero-shot entity classification to extract preferences, facts, decisions, and corrections from the conversation before context is lost.
+- **Context summarization** (`summary_strategy: offline`): LLMLingua-2 (XLM-RoBERTa, 355M params) performs token-level keep/discard classification, retaining 95-98% of information at 2-5x compression. Trained on MeetingBank conversation data.
+
+Both models support 100+ languages, run on CPU or GPU, and require no network access. Install with: `pip install gliner2 llmlingua`
+
+The `offline_rate` controls how aggressively LLMLingua-2 compresses (0.3 = keep 30% of tokens, 0.5 = keep 50%). Lower values produce smaller summaries; higher values preserve more detail.
+
+You can mix strategies — for example, use `flush_strategy: offline` with `summary_strategy: llm` to keep LLM-quality summaries while extracting memories offline.
 
 ### How the three knobs interact
 

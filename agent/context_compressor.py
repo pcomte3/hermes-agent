@@ -302,10 +302,26 @@ class ContextCompressor(ContextEngine):
         inspired by Pi-mono and OpenCode. When a previous summary exists,
         generates an iterative update instead of summarizing from scratch.
 
+        When ``summary_strategy`` is ``"offline"``, uses LLMLingua-2 token-level
+        extractive compression instead of an LLM call.
+
         Returns None if all attempts fail — the caller should drop
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        if getattr(self, "summary_strategy", "llm") == "offline":
+            try:
+                from agent.offline_extractor import compress_summary
+                summary = compress_summary(
+                    self._serialize_for_summary(turns_to_summarize),
+                    rate=getattr(self, "offline_rate", 0.3))
+                if summary:
+                    self._previous_summary = summary
+                    return self._with_summary_prefix(summary)
+            except Exception as e:
+                logger.warning("Offline summary failed, falling back to LLM: %s", e)
+
+
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
             logger.debug(

@@ -27,6 +27,13 @@ fal-client
 # Text-to-speech (Edge TTS is free, no API key needed)
 edge-tts
 
+# Offline data sovereignty: language-agnostic summarization and compression
+# without LLM dependency. Required for compression.flush_strategy=offline
+# and compression.summary_strategy=offline. Both are encoder-only models
+# (GLiNER2 205M + XLM-RoBERTa 355M), multilingual, CPU/GPU compatible.
+llmlingua
+gliner2
+
 # Optional: For cron expression parsing (cronjob scheduling)
 croniter
 

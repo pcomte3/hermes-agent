@@ -361,6 +361,13 @@ DEFAULT_CONFIG = {
         "summary_model": "",          # empty = use main configured model
         "summary_provider": "auto",
         "summary_base_url": None,
+        "flush_strategy": "llm",      # "llm" (default) or "offline" — memory extraction before compression
+        "summary_strategy": "llm",    # "llm" (default) or "offline" — context summarization method
+        "offline_rate": 0.3,          # fraction of tokens to retain when summary_strategy=offline (0.0-1.0)
+        # When set to "offline", no LLM calls are made during compression.
+        # Uses GLiNER2 (entity extraction) and LLMLingua-2 (token compression)
+        # for language-agnostic, privacy-preserving offline operation.
+        # Requires: pip install gliner2 llmlingua
     },
     "smart_model_routing": {
         "enabled": False,
