@@ -23,17 +23,13 @@ Resolution order for vision/multimodal tasks (auto mode):
   6. Custom endpoint (for local vision models: Qwen-VL, LLaVA, Pixtral, etc.)
   7. None
 
-Per-task provider overrides (e.g. AUXILIARY_VISION_PROVIDER,
-CONTEXT_COMPRESSION_PROVIDER) can force a specific provider for each task.
+Per-task overrides are configured in config.yaml under the ``auxiliary:`` section
+(e.g. ``auxiliary.vision.provider``, ``auxiliary.compression.model``).
 Default "auto" follows the chains above.
 
-Per-task model overrides (e.g. AUXILIARY_VISION_MODEL,
-AUXILIARY_WEB_EXTRACT_MODEL) let callers use a different model slug
-than the provider's default.
-
-Per-task direct endpoint overrides (e.g. AUXILIARY_VISION_BASE_URL,
-AUXILIARY_VISION_API_KEY) let callers route a specific auxiliary task to a
-custom OpenAI-compatible endpoint without touching the main model settings.
+Legacy env var overrides (AUXILIARY_{TASK}_PROVIDER, AUXILIARY_{TASK}_MODEL,
+AUXILIARY_{TASK}_BASE_URL, etc.) are still read as a backward-compat fallback
+but config.yaml takes priority.  New configuration should always use config.yaml.
 
 Payment / credit exhaustion fallback:
   When a resolved provider returns HTTP 402 or a credit-related error,
@@ -109,6 +105,14 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3-flash-preview",
+}
+
+# Vision-specific model overrides for direct providers.
+# When the user's main provider has a dedicated vision/multimodal model that
+# differs from their main chat model, map it here.  The vision auto-detect
+# "exotic provider" branch checks this before falling back to the main model.
+_PROVIDER_VISION_MODELS: Dict[str, str] = {
+    "xiaomi": "mimo-v2-omni",
 }
 
 # OpenRouter app attribution headers
@@ -1017,6 +1021,23 @@ _AUTO_PROVIDER_LABELS = {
 
 _AGGREGATOR_PROVIDERS = frozenset({"openrouter", "nous"})
 
+_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode")
+
+
+def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Return a sanitized copy of a live main-runtime override."""
+    if not isinstance(main_runtime, dict):
+        return {}
+    normalized: Dict[str, str] = {}
+    for field in _MAIN_RUNTIME_FIELDS:
+        value = main_runtime.get(field)
+        if isinstance(value, str) and value.strip():
+            normalized[field] = value.strip()
+    provider = normalized.get("provider")
+    if provider:
+        normalized["provider"] = provider.lower()
+    return normalized
+
 
 def _get_provider_chain() -> List[tuple]:
     """Return the ordered provider detection chain.
@@ -1126,7 +1147,7 @@ def _try_payment_fallback(
     return None, None, ""
 
 
-def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
+def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain.
 
     Priority:
@@ -1138,6 +1159,12 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    runtime = _normalize_main_runtime(main_runtime)
+    runtime_provider = runtime.get("provider", "")
+    runtime_model = runtime.get("model", "")
+    runtime_base_url = runtime.get("base_url", "")
+    runtime_api_key = runtime.get("api_key", "")
+    runtime_api_mode = runtime.get("api_mode", "")
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -1145,7 +1172,7 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     #    old OPENAI_BASE_URL lingers in ~/.hermes/.env. ──
     if not _stale_base_url_warned:
         _env_base = os.getenv("OPENAI_BASE_URL", "").strip()
-        _cfg_provider = _read_main_provider()
+        _cfg_provider = runtime_provider or _read_main_provider()
         if (_env_base and _cfg_provider
                 and _cfg_provider != "custom"
                 and not _cfg_provider.startswith("custom:")):
@@ -1159,12 +1186,25 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
             _stale_base_url_warned = True
 
     # ── Step 1: non-aggregator main provider → use main model directly ──
-    main_provider = _read_main_provider()
-    main_model = _read_main_model()
+    main_provider = runtime_provider or _read_main_provider()
+    main_model = runtime_model or _read_main_model()
     if (main_provider and main_model
             and main_provider not in _AGGREGATOR_PROVIDERS
             and main_provider not in ("auto", "")):
-        client, resolved = resolve_provider_client(main_provider, main_model)
+        resolved_provider = main_provider
+        explicit_base_url = None
+        explicit_api_key = None
+        if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
+            resolved_provider = "custom"
+            explicit_base_url = runtime_base_url
+            explicit_api_key = runtime_api_key or None
+        client, resolved = resolve_provider_client(
+            resolved_provider,
+            main_model,
+            explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_api_key,
+            api_mode=runtime_api_mode or None,
+        )
         if client is not None:
             logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                         main_provider, resolved or main_model)
@@ -1245,6 +1285,7 @@ def resolve_provider_client(
     explicit_base_url: str = None,
     explicit_api_key: str = None,
     api_mode: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -1315,7 +1356,7 @@ def resolve_provider_client(
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
-        client, resolved = _resolve_auto()
+        client, resolved = _resolve_auto(main_runtime=main_runtime)
         if client is None:
             return None, None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
@@ -1539,7 +1580,11 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def get_text_auxiliary_client(task: str = "") -> Tuple[Optional[OpenAI], Optional[str]]:
+def get_text_auxiliary_client(
+    task: str = "",
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only auxiliary tasks.
 
     Args:
@@ -1556,10 +1601,11 @@ def get_text_auxiliary_client(task: str = "") -> Tuple[Optional[OpenAI], Optiona
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
+        main_runtime=main_runtime,
     )
 
 
-def get_async_text_auxiliary_client(task: str = ""):
+def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None):
     """Return (async_client, model_slug) for async consumers.
 
     For standard providers returns (AsyncOpenAI, model). For Codex returns
@@ -1574,6 +1620,7 @@ def get_async_text_auxiliary_client(task: str = ""):
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
+        main_runtime=main_runtime,
     )
 
 
@@ -1687,16 +1734,18 @@ def resolve_vision_provider_client(
                 if sync_client is not None:
                     return _finalize(main_provider, sync_client, default_model)
             else:
-                # Exotic provider (DeepSeek, Alibaba, named custom, etc.)
+                # Exotic provider (DeepSeek, Alibaba, Xiaomi, named custom, etc.)
+                # Use provider-specific vision model if available, otherwise main model.
+                vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
                 rpc_client, rpc_model = resolve_provider_client(
-                    main_provider, main_model)
+                    main_provider, vision_model)
                 if rpc_client is not None:
                     logger.info(
                         "Vision auto-detect: using active provider %s (%s)",
-                        main_provider, rpc_model or main_model,
+                        main_provider, rpc_model or vision_model,
                     )
                     return _finalize(
-                        main_provider, rpc_client, rpc_model or main_model)
+                        main_provider, rpc_client, rpc_model or vision_model)
 
         # Fall back through aggregators.
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
@@ -1886,6 +1935,7 @@ def _get_cached_client(
     base_url: str = None,
     api_key: str = None,
     api_mode: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Get or create a cached client for the given provider.
 
@@ -1909,7 +1959,9 @@ def _get_cached_client(
             loop_id = id(current_loop)
         except RuntimeError:
             pass
-    cache_key = (provider, async_mode, base_url or "", api_key or "", api_mode or "", loop_id)
+    runtime = _normalize_main_runtime(main_runtime)
+    runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    cache_key = (provider, async_mode, base_url or "", api_key or "", api_mode or "", loop_id, runtime_key)
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
@@ -1934,6 +1986,7 @@ def _get_cached_client(
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
+        main_runtime=runtime,
     )
     if client is not None:
         # For async clients, remember which loop they were created on so we
@@ -1958,8 +2011,8 @@ def _resolve_task_provider_model(
 
     Priority:
       1. Explicit provider/model/base_url/api_key args (always win)
-      2. Env var overrides (AUXILIARY_{TASK}_*, CONTEXT_{TASK}_*)
-      3. Config file (auxiliary.{task}.* or compression.*)
+      2. Config file (auxiliary.{task}.* or compression.*)
+      3. Env var overrides (backward-compat: AUXILIARY_{TASK}_*, CONTEXT_{TASK}_*)
       4. "auto" (full auto-detection chain)
 
     Returns (provider, model, base_url, api_key, api_mode) where model may
@@ -2002,10 +2055,11 @@ def _resolve_task_provider_model(
                 _sbu = comp.get("summary_base_url") or ""
                 cfg_base_url = cfg_base_url or _sbu.strip() or None
 
+    # Env vars are backward-compat fallback only — config.yaml is primary.
     env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
     env_api_mode = _get_auxiliary_env_override(task, "API_MODE") if task else None
-    resolved_model = model or env_model or cfg_model
-    resolved_api_mode = env_api_mode or cfg_api_mode
+    resolved_model = model or cfg_model or env_model
+    resolved_api_mode = cfg_api_mode or env_api_mode
 
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
@@ -2013,19 +2067,23 @@ def _resolve_task_provider_model(
         return provider, resolved_model, base_url, api_key, resolved_api_mode
 
     if task:
+        # Config.yaml is the primary source for per-task overrides.
+        if cfg_base_url:
+            return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
+        if cfg_provider and cfg_provider != "auto":
+            return cfg_provider, resolved_model, None, None, resolved_api_mode
+
+        # Env vars are backward-compat fallback for users who haven't
+        # migrated to config.yaml yet.
         env_base_url = _get_auxiliary_env_override(task, "BASE_URL")
         env_api_key = _get_auxiliary_env_override(task, "API_KEY")
         if env_base_url:
-            return "custom", resolved_model, env_base_url, env_api_key or cfg_api_key, resolved_api_mode
+            return "custom", resolved_model, env_base_url, env_api_key, resolved_api_mode
 
         env_provider = _get_auxiliary_provider(task)
         if env_provider != "auto":
             return env_provider, resolved_model, None, None, resolved_api_mode
 
-        if cfg_base_url:
-            return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
-        if cfg_provider and cfg_provider != "auto":
-            return cfg_provider, resolved_model, None, None, resolved_api_mode
         return "auto", resolved_model, None, None, resolved_api_mode
 
     return "auto", resolved_model, None, None, resolved_api_mode
@@ -2052,6 +2110,75 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
         except (ValueError, TypeError):
             pass
     return default
+
+
+# ---------------------------------------------------------------------------
+# Anthropic-compatible endpoint detection + image block conversion
+# ---------------------------------------------------------------------------
+
+# Providers that use Anthropic-compatible endpoints (via OpenAI SDK wrapper).
+# Their image content blocks must use Anthropic format, not OpenAI format.
+_ANTHROPIC_COMPAT_PROVIDERS = frozenset({"minimax", "minimax-cn"})
+
+
+def _is_anthropic_compat_endpoint(provider: str, base_url: str) -> bool:
+    """Detect if an endpoint expects Anthropic-format content blocks.
+
+    Returns True for known Anthropic-compatible providers (MiniMax) and
+    any endpoint whose URL contains ``/anthropic`` in the path.
+    """
+    if provider in _ANTHROPIC_COMPAT_PROVIDERS:
+        return True
+    url_lower = (base_url or "").lower()
+    return "/anthropic" in url_lower
+
+
+def _convert_openai_images_to_anthropic(messages: list) -> list:
+    """Convert OpenAI ``image_url`` content blocks to Anthropic ``image`` blocks.
+
+    Only touches messages that have list-type content with ``image_url`` blocks;
+    plain text messages pass through unchanged.
+    """
+    converted = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            converted.append(msg)
+            continue
+        new_content = []
+        changed = False
+        for block in content:
+            if block.get("type") == "image_url":
+                image_url_val = (block.get("image_url") or {}).get("url", "")
+                if image_url_val.startswith("data:"):
+                    # Parse data URI: data:<media_type>;base64,<data>
+                    header, _, b64data = image_url_val.partition(",")
+                    media_type = "image/png"
+                    if ":" in header and ";" in header:
+                        media_type = header.split(":", 1)[1].split(";", 1)[0]
+                    new_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64data,
+                        },
+                    })
+                else:
+                    # URL-based image
+                    new_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": image_url_val,
+                        },
+                    })
+                changed = True
+            else:
+                new_content.append(block)
+        converted.append({**msg, "content": new_content} if changed else msg)
+    return converted
+
 
 
 def _build_call_kwargs(
@@ -2138,6 +2265,7 @@ def call_llm(
     model: str = None,
     base_url: str = None,
     api_key: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
     messages: list,
     temperature: float = None,
     max_tokens: int = None,
@@ -2203,6 +2331,7 @@ def call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -2223,7 +2352,7 @@ def call_llm(
             if not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto")
+                client, final_model = _get_cached_client("auto", main_runtime=main_runtime)
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -2243,6 +2372,11 @@ def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
+
+    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
+    _client_base = str(getattr(client, "base_url", "") or "")
+    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
@@ -2431,6 +2565,11 @@ async def async_call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
+
+    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
+    _client_base = str(getattr(client, "base_url", "") or "")
+    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
         return _validate_llm_response(
